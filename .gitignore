@@ -1,0 +1,33 @@
+node_modules
+dist
+.env
+.secrets/*.json
+.secrets/*.pem
+data/*.db
+data/*.sqlite
+data/*.sqlite3
+coverage
+
+# Logs
+logs
+*.log
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# Private development artifacts (user request)
+plans/
+docs/winning-strategy.md
+docs/hackathon-evaluation.md
+docs/project-analysis.md
+*.md.tmp
+
+# Internal test suite (user request - "judges should not find")
+tests/
+test-results/
+.jest/
+

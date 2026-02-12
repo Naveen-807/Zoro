@@ -1,0 +1,44 @@
+{
+  "name": "zoro",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Doc-driven paid, authorized, encrypted agentic commerce demo",
+  "type": "module",
+  "engines": {
+    "node": ">=20"
+  },
+  "scripts": {
+    "dev": "tsx watch src/main.ts",
+    "start": "node dist/src/main.js",
+    "build": "tsc -p tsconfig.json",
+    "test": "vitest run",
+    "test:watch": "vitest",
+    "db:migrate": "tsx scripts/migrate.ts",
+    "setup:cdp": "tsx scripts/setup-cdp-wallet.ts",
+    "export:evidence": "tsx scripts/export-evidence.ts"
+  },
+  "dependencies": {
+    "@coinbase/cdp-sdk": "^1.44.0",
+    "@coinbase/onchainkit": "^1.1.2",
+    "@google/generative-ai": "^0.24.1",
+    "@hono/node-server": "^1.13.7",
+    "@skalenetwork/bite": "^0.7.1",
+    "@walletconnect/sign-client": "^2.19.1",
+    "@x402/evm": "^2.3.0",
+    "@x402/fetch": "^2.3.0",
+    "@x402/hono": "^2.3.0",
+    "better-sqlite3": "^11.7.0",
+    "dotenv": "^16.4.7",
+    "googleapis": "^144.0.0",
+    "hono": "^4.6.16",
+    "viem": "^2.22.23",
+    "zod": "^3.24.1"
+  },
+  "devDependencies": {
+    "@types/better-sqlite3": "^7.6.12",
+    "@types/node": "^22.10.2",
+    "tsx": "^4.19.2",
+    "typescript": "^5.7.2",
+    "vitest": "^2.1.8"
+  }
+}

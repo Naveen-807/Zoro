@@ -1,0 +1,161 @@
+{
+  "generatedAt": "2026-02-10T14:46:36.584Z",
+  "docId": "local-doc",
+  "commandCount": 3,
+  "commands": [
+    {
+      "docId": "local-doc",
+      "cmdId": "cmd_ee40506d3a4b44ab",
+      "rawCmd": "DW PAY_VENDOR ACME 200 USDC TO 0x1111111111111111111111111111111111111111 DATA_BUDGET 1 MAX_TOTAL 2",
+      "parsed": {
+        "kind": "PAY_VENDOR",
+        "vendor": "ACME",
+        "amountUsdc": 200,
+        "to": "0x1111111111111111111111111111111111111111",
+        "dataBudgetUsdc": 1,
+        "maxTotalUsdc": 2
+      },
+      "status": "AWAITING_APPROVAL",
+      "createdAt": "2026-02-10T14:46:30.900Z",
+      "updatedAt": "2026-02-10T14:46:30.902Z",
+      "lastError": null,
+      "trace": {
+        "command": {
+          "docId": "local-doc",
+          "cmdId": "cmd_ee40506d3a4b44ab",
+          "rawCmd": "DW PAY_VENDOR ACME 200 USDC TO 0x1111111111111111111111111111111111111111 DATA_BUDGET 1 MAX_TOTAL 2",
+          "parsed": {
+            "kind": "PAY_VENDOR",
+            "vendor": "ACME",
+            "amountUsdc": 200,
+            "to": "0x1111111111111111111111111111111111111111",
+            "dataBudgetUsdc": 1,
+            "maxTotalUsdc": 2
+          },
+          "status": "AWAITING_APPROVAL",
+          "createdAt": "2026-02-10T14:46:30.900Z",
+          "updatedAt": "2026-02-10T14:46:30.902Z",
+          "lastError": null
+        },
+        "intent": {
+          "id": "intent_c13e973fae2a20c1",
+          "docId": "local-doc",
+          "cmdId": "cmd_ee40506d3a4b44ab",
+          "action": "PAY_VENDOR",
+          "maxTotalUsdc": 2,
+          "toolPlan": [
+            {
+              "toolName": "vendor-risk",
+              "endpoint": "/tools/vendor-risk",
+              "priceUsdc": 0.25,
+              "reason": "Standard risk check for sub-250 payout"
+            },
+            {
+              "toolName": "compliance-check",
+              "endpoint": "/tools/compliance-check",
+              "priceUsdc": 0.5,
+              "reason": "Compliance screening required for payouts"
+            }
+          ],
+          "createdAt": "2026-02-10T14:46:30.901Z"
+        },
+        "cart": null,
+        "x402Receipts": [],
+        "ap2Receipts": []
+      },
+      "spend": []
+    },
+    {
+      "docId": "local-doc",
+      "cmdId": "cmd_9fbca7f5e7b85b9f",
+      "rawCmd": "DW TREASURY_SWAP 25 USDC TO WETH SLIPPAGE 50 MAX_SPEND 30",
+      "parsed": {
+        "kind": "TREASURY_SWAP",
+        "amountUsdc": 25,
+        "toToken": "WETH",
+        "slippageBps": 50,
+        "maxSpendUsdc": 30
+      },
+      "status": "AWAITING_APPROVAL",
+      "createdAt": "2026-02-10T14:46:30.903Z",
+      "updatedAt": "2026-02-10T14:46:30.903Z",
+      "lastError": null,
+      "trace": {
+        "command": {
+          "docId": "local-doc",
+          "cmdId": "cmd_9fbca7f5e7b85b9f",
+          "rawCmd": "DW TREASURY_SWAP 25 USDC TO WETH SLIPPAGE 50 MAX_SPEND 30",
+          "parsed": {
+            "kind": "TREASURY_SWAP",
+            "amountUsdc": 25,
+            "toToken": "WETH",
+            "slippageBps": 50,
+            "maxSpendUsdc": 30
+          },
+          "status": "AWAITING_APPROVAL",
+          "createdAt": "2026-02-10T14:46:30.903Z",
+          "updatedAt": "2026-02-10T14:46:30.903Z",
+          "lastError": null
+        },
+        "intent": {
+          "id": "intent_6482e3b77244a5f1",
+          "docId": "local-doc",
+          "cmdId": "cmd_9fbca7f5e7b85b9f",
+          "action": "TREASURY_SWAP",
+          "maxTotalUsdc": 2,
+          "toolPlan": [],
+          "createdAt": "2026-02-10T14:46:30.903Z"
+        },
+        "cart": null,
+        "x402Receipts": [],
+        "ap2Receipts": []
+      },
+      "spend": []
+    },
+    {
+      "docId": "local-doc",
+      "cmdId": "cmd_c3910bb5f94b2144",
+      "rawCmd": "DW PRIVATE_PAYOUT 50 USDC TO 0x2222222222222222222222222222222222222222 AT 2026-02-13T12:00:00Z",
+      "parsed": {
+        "kind": "PRIVATE_PAYOUT",
+        "amountUsdc": 50,
+        "to": "0x2222222222222222222222222222222222222222",
+        "unlockAt": "2026-02-13T12:00:00Z"
+      },
+      "status": "AWAITING_APPROVAL",
+      "createdAt": "2026-02-10T14:46:30.903Z",
+      "updatedAt": "2026-02-10T14:46:30.903Z",
+      "lastError": null,
+      "trace": {
+        "command": {
+          "docId": "local-doc",
+          "cmdId": "cmd_c3910bb5f94b2144",
+          "rawCmd": "DW PRIVATE_PAYOUT 50 USDC TO 0x2222222222222222222222222222222222222222 AT 2026-02-13T12:00:00Z",
+          "parsed": {
+            "kind": "PRIVATE_PAYOUT",
+            "amountUsdc": 50,
+            "to": "0x2222222222222222222222222222222222222222",
+            "unlockAt": "2026-02-13T12:00:00Z"
+          },
+          "status": "AWAITING_APPROVAL",
+          "createdAt": "2026-02-10T14:46:30.903Z",
+          "updatedAt": "2026-02-10T14:46:30.903Z",
+          "lastError": null
+        },
+        "intent": {
+          "id": "intent_ef3f4b8f1af4d202",
+          "docId": "local-doc",
+          "cmdId": "cmd_c3910bb5f94b2144",
+          "action": "PRIVATE_PAYOUT",
+          "maxTotalUsdc": 2,
+          "toolPlan": [],
+          "createdAt": "2026-02-10T14:46:30.903Z"
+        },
+        "cart": null,
+        "x402Receipts": [],
+        "ap2Receipts": []
+      },
+      "spend": []
+    }
+  ]
+}
