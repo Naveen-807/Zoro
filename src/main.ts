@@ -128,6 +128,7 @@ async function main(): Promise<void> {
   const httpServer = startHttpServer({
     orchestrator,
     cdpWallet,
+    docService,
     config
   });
 
@@ -144,7 +145,8 @@ async function main(): Promise<void> {
 
   const interval = setInterval(async () => {
     try {
-      await orchestrator.tick(docId);
+      const activeDocId = docService.getDocId();
+      await orchestrator.tick(activeDocId);
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error);
       console.error(`Tick error: ${message}`);

@@ -2,25 +2,30 @@ import { Hono } from "hono";
 import { serve } from "@hono/node-server";
 import type { Orchestrator } from "../engine/orchestrator.js";
 import type { CdpWalletService } from "../x402/cdp.js";
+import type { GoogleDocService } from "../google/doc.js";
 import type { AppConfig } from "../config.js";
 
 export type HttpServerDeps = {
   orchestrator: Orchestrator;
   cdpWallet: CdpWalletService;
+  docService: GoogleDocService;
   config: AppConfig;
 };
 
-export function startHttpServer({ orchestrator, cdpWallet, config }: HttpServerDeps): { close: () => Promise<void> } {
+export function startHttpServer({ orchestrator, cdpWallet, docService, config }: HttpServerDeps): { close: () => Promise<void> } {
   const app = new Hono();
 
   app.get("/", async (c) => {
-    const docId = config.GOOGLE_DOC_ID ?? "local-doc";
+    const docId = docService.getDocId();
     return c.json({
       service: "zoro",
       mode: config.STRICT_LIVE_MODE === 1 ? "LIVE" : "DEV",
       docId,
+      docUrl: docId !== "local-doc" ? `https://docs.google.com/document/d/${docId}/edit` : null,
       endpoints: {
         tick: `POST /api/tick/${docId}`,
+        switchDoc: "POST /api/doc/set",
+        refreshTemplate: "POST /api/doc/refresh",
         trace: "GET /api/commands/:docId/:cmdId/trace",
         receipt: "GET /api/receipt/:docId/:cmdId",
         approval: "POST /api/ap2/cmd/:docId/:cmdId/request-approval",
@@ -28,6 +33,42 @@ export function startHttpServer({ orchestrator, cdpWallet, config }: HttpServerD
       },
       auth: "cdp-wallet-eip712"
     });
+  });
+
+  // ── Doc Management ──────────────────────────────────────────────────────
+  app.post("/api/doc/set", async (c) => {
+    try {
+      const body = await c.req.json().catch(() => ({})) as Record<string, unknown>;
+      const newDocId = typeof body.docId === "string" ? body.docId.trim() : "";
+      if (!newDocId) {
+        return c.json({ ok: false, error: "Provide { \"docId\": \"your-google-doc-id\" }" }, 400);
+      }
+      const resolvedId = await docService.setDocId(newDocId);
+      return c.json({
+        ok: true,
+        docId: resolvedId,
+        docUrl: `https://docs.google.com/document/d/${resolvedId}/edit`,
+        message: "Switched to new doc. Template has been written. Tick loop is now using this doc."
+      });
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : String(err);
+      return c.json({ ok: false, error: msg }, 400);
+    }
+  });
+
+  app.post("/api/doc/refresh", async (c) => {
+    try {
+      const docId = await docService.ensureTemplate();
+      return c.json({
+        ok: true,
+        docId,
+        docUrl: docId !== "local-doc" ? `https://docs.google.com/document/d/${docId}/edit` : null,
+        message: "Template refreshed on current doc."
+      });
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : String(err);
+      return c.json({ ok: false, error: msg }, 500);
+    }
   });
 
   app.post("/api/tick/:docId", async (c) => {

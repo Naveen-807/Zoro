@@ -27,13 +27,6 @@ export type PendingApprovalRow = {
   checkboxState: "UNCHECKED" | "CHECKED";
 };
 
-export type ConnectionStatus = {
-  state: "DISCONNECTED" | "CONNECTING" | "CONNECTED";
-  uri?: string;
-  address?: string;
-  connectedAt?: string;
-};
-
 type GoogleDocServiceOptions = {
   docId?: string;
   auth: JWT | null;
@@ -48,22 +41,18 @@ type TableRef = {
 };
 
 const TEMPLATE_TITLE = "Zoro - Agentic Commerce Engine";
-const TEMPLATE_VERSION = "table-ui-v1";
+const TEMPLATE_VERSION = "table-ui-v2";
 const TEMPLATE_MARKER = `[[ZORO_TEMPLATE_VERSION:${TEMPLATE_VERSION}]]`;
 
 const TAB_NAMES = {
-  CHAT: "Chat with Wallet",
-  TRANSACTIONS: "View Transactions",
-  CONNECT: "Connect to Dapp",
-  PENDING: "Pending Transactions",
+  CHAT: "Commands",
+  TRANSACTIONS: "Transactions",
+  PENDING: "Approvals",
   LOGS: "Agent Logs"
 } as const;
 
 const CHAT_INPUT_HEADERS = ["Command", "Parameters", "Status"] as const;
 const CHAT_REFERENCE_HEADERS = ["CommandType", "Example"] as const;
-const CONNECT_STATUS_HEADERS = ["Property", "Value"] as const;
-const CONNECT_URI_HEADERS = ["WalletConnect URI (Click to Connect)"] as const;
-const CONNECT_PASTE_HEADERS = ["Paste dApp wc: URI here"] as const;
 const PENDING_AWAITING_HEADERS = ["QueueID", "Command", "Target", "Amount", "Risk", "Status", "Approve"] as const;
 const PENDING_AUTO_HEADERS = ["QueueID", "Command", "Target", "Amount", "Risk", "Status"] as const;
 const TX_HISTORY_HEADERS = ["Timestamp", "Type", "Asset", "Amount", "Status", "Tx Hash", "Block", "Confirmations"] as const;
@@ -83,21 +72,6 @@ export class GoogleDocService {
   /** Track which findTableByHeaders warnings have already been logged */
   private readonly _warnedTableLookups = new Set<string>();
 
-  /** Save a discovered doc ID into .env so it's reused on next start */
-  private persistDocId(docId: string): void {
-    try {
-      const envPath = ".env";
-      if (!fs.existsSync(envPath)) return;
-      let content = fs.readFileSync(envPath, "utf8");
-      if (/^GOOGLE_DOC_ID=.+/m.test(content)) return; // already set
-      content = content.replace(/^GOOGLE_DOC_ID=\s*$/m, `GOOGLE_DOC_ID=${docId}`);
-      fs.writeFileSync(envPath, content, "utf8");
-      console.log(`  ✓ Saved GOOGLE_DOC_ID=${docId} to .env`);
-    } catch {
-      // Non-critical — ignore
-    }
-  }
-
   constructor(options: GoogleDocServiceOptions) {
     this.docId = options.docId;
     this.auth = options.auth;
@@ -107,6 +81,24 @@ export class GoogleDocService {
 
   getDocId(): string {
     return this.resolvedDocId ?? this.docId ?? "local-doc";
+  }
+
+  /** Switch to a different doc at runtime — rewrites template and returns the new ID */
+  async setDocId(newDocId: string): Promise<string> {
+    if (!this.auth) {
+      throw new Error("Google auth not available");
+    }
+    const docs = google.docs({ version: "v1", auth: this.auth });
+    // Verify we can access it
+    await docs.documents.get({ documentId: newDocId, includeTabsContent: true });
+    this.docId = newDocId;
+    this.resolvedDocId = newDocId;
+    this._warnedTableLookups.clear();
+    console.log(`[DocService] Switched to doc: ${newDocId}`);
+    // Always write fresh template
+    await this.writeTemplateToDoc(newDocId);
+    console.log(`[DocService] Template written to new doc`);
+    return newDocId;
   }
 
   async ensureTemplate(): Promise<string> {
@@ -142,20 +134,21 @@ export class GoogleDocService {
       }
     }
 
-    // ── Step 2: Auto-discover a Google Doc shared with the service account ──
+    // ── Step 2: Auto-discover the most recently modified Google Doc shared with the service account ──
     try {
       const searchResult = await drive.files.list({
         q: "mimeType='application/vnd.google-apps.document' and trashed=false",
         pageSize: 10,
-        fields: "files(id,name,createdTime)",
-        orderBy: "createdTime desc"
+        fields: "files(id,name,modifiedTime)",
+        orderBy: "modifiedTime desc"
       });
       const sharedDocs = searchResult.data.files ?? [];
       if (sharedDocs.length > 0 && sharedDocs[0]?.id) {
         const picked = sharedDocs[0]!;
         this.resolvedDocId = picked.id!;
         console.log(`✓ Auto-discovered shared doc: "${picked.name ?? "Untitled"}" (${this.resolvedDocId})`);
-        console.log(`  💡 To skip discovery next time, add to .env: GOOGLE_DOC_ID=${this.resolvedDocId}`);
+        console.log(`  💡 To pin this doc, add to .env: GOOGLE_DOC_ID=${this.resolvedDocId}`);
+        console.log(`  💡 Or switch docs anytime: POST /api/doc/set { "docId": "..." }`);
 
         // Check if it already has our template
         try {
@@ -171,7 +164,6 @@ export class GoogleDocService {
 
         console.log(`  Writing Zoro template to doc...`);
         await this.writeTemplateToDoc(this.resolvedDocId);
-        this.persistDocId(this.resolvedDocId);
         return this.resolvedDocId;
       }
     } catch (discoverError) {
@@ -218,7 +210,6 @@ export class GoogleDocService {
     if (!this.resolvedDocId) {
       throw new Error("Neither Docs API nor Drive API returned a document ID");
     }
-    this.persistDocId(this.resolvedDocId);
 
     await this.writeTemplateToDoc(this.resolvedDocId);
     
@@ -516,55 +507,6 @@ export class GoogleDocService {
     );
   }
 
-  async readWalletConnectUri(): Promise<string | null> {
-    const rows = await this.readTableRows(TAB_NAMES.CONNECT, "🔗", CONNECT_PASTE_HEADERS);
-    const candidate = (rows[0]?.values[0] ?? "").trim();
-    return candidate.startsWith("wc:") ? candidate : null;
-  }
-
-  async clearWalletConnectUri(): Promise<void> {
-    await this.writeTableCellByHeaders(TAB_NAMES.CONNECT, "🔗", CONNECT_PASTE_HEADERS, 1, 0, "");
-  }
-
-  async updateConnectionStatus(status: ConnectionStatus): Promise<void> {
-    const valueByProperty = new Map<string, string>([
-      ["Status", status.state],
-      ["Wallet Address", status.address?.trim() || "None"],
-      ["Network", `Base Sepolia (${this.config.BASE_CHAIN_ID})`],
-      ["Connected At", status.connectedAt || nowIso()]
-    ]);
-
-    const rows = await this.readTableRows(TAB_NAMES.CONNECT, "🔗", CONNECT_STATUS_HEADERS);
-    for (const row of rows) {
-      const property = (row.values[0] ?? "").trim();
-      if (!valueByProperty.has(property)) {
-        continue;
-      }
-      await this.writeTableCellByHeaders(
-        TAB_NAMES.CONNECT,
-        "🔗",
-        CONNECT_STATUS_HEADERS,
-        row.rowIndex,
-        1,
-        valueByProperty.get(property) ?? ""
-      );
-    }
-
-    const uriValue = status.uri?.trim() || "";
-    await this.writeTableCellByHeaders(TAB_NAMES.CONNECT, "🔗", CONNECT_URI_HEADERS, 1, 0, uriValue);
-    if (uriValue.startsWith("wc:")) {
-      await this.setTableCellLinkByHeaders(
-        TAB_NAMES.CONNECT,
-        "🔗",
-        CONNECT_URI_HEADERS,
-        1,
-        0,
-        uriValue,
-        uriValue
-      );
-    }
-  }
-
   async readTabLines(tabNameFragment: string): Promise<string[]> {
     const snapshot = await this.getDocumentSnapshot();
     if (!snapshot) {
@@ -707,9 +649,8 @@ export class GoogleDocService {
         requests: [
           { updateDocumentTabProperties: { tabProperties: { tabId: mainTabId, title: `💬 ${TAB_NAMES.CHAT}` }, fields: "title" } },
           { addDocumentTab: { tabProperties: { title: `📊 ${TAB_NAMES.TRANSACTIONS}`, index: 1 } } },
-          { addDocumentTab: { tabProperties: { title: `🔗 ${TAB_NAMES.CONNECT}`, index: 2 } } },
-          { addDocumentTab: { tabProperties: { title: `⏳ ${TAB_NAMES.PENDING}`, index: 3 } } },
-          { addDocumentTab: { tabProperties: { title: `🤖 ${TAB_NAMES.LOGS}`, index: 4 } } }
+          { addDocumentTab: { tabProperties: { title: `⏳ ${TAB_NAMES.PENDING}`, index: 2 } } },
+          { addDocumentTab: { tabProperties: { title: `🤖 ${TAB_NAMES.LOGS}`, index: 3 } } }
         ] as unknown as docs_v1.Schema$Request[]
       }
     });
@@ -724,51 +665,34 @@ export class GoogleDocService {
 
     await this.populateChatTab(docId, tabIds[0] ?? mainTabId);
     await this.populateTransactionsTab(docId, tabIds[1] ?? mainTabId);
-    await this.populateConnectTab(docId, tabIds[2] ?? mainTabId);
-    await this.populatePendingTab(docId, tabIds[3] ?? mainTabId);
-    await this.populateLogsTab(docId, tabIds[4] ?? mainTabId);
+    await this.populatePendingTab(docId, tabIds[2] ?? mainTabId);
+    await this.populateLogsTab(docId, tabIds[3] ?? mainTabId);
   }
 
   private async populateChatTab(docId: string, tabId: string): Promise<void> {
-    await this.insertTextAtEnd(docId, tabId, `💬 ${TAB_NAMES.CHAT}\n${TEMPLATE_MARKER}\nType commands in the INPUT table below. Status updates appear in OUTPUT.\n\n▸ COMMAND INPUT\n`);
+    await this.insertTextAtEnd(docId, tabId, `💬 ${TAB_NAMES.CHAT}\n${TEMPLATE_MARKER}\nType a command in the Parameters column below. Zoro will process it automatically.\n\n▸ COMMAND INPUT\n`);
 
-    const commandRows = createRows(20, 3, "");
-    commandRows[0] = ["[NEW]", "", "[AWAITING]"];
+    const commandRows = createRows(5, 3, "");
     await this.insertTableAtEnd(docId, tabId, [...CHAT_INPUT_HEADERS], commandRows);
 
-    await this.insertTextAtEnd(docId, tabId, "\n▸ QUICK REFERENCE\n");
+    await this.insertTextAtEnd(docId, tabId, "\n▸ EXAMPLES\n");
     await this.insertTableAtEnd(docId, tabId, [...CHAT_REFERENCE_HEADERS], [
-      ["PAY_VENDOR", "Pay ACME 50 USDC to 0x1234567890abcdef"],
+      ["PAY_VENDOR", "Pay ACME 50 USDC to 0x1234…abcdef"],
       ["TREASURY_SWAP", "Swap 100 USDC to WETH"],
-      ["PRIVATE_PAYOUT", "Private payout 10 USDC to 0xabc unlock at 2026-01-01"],
-      ["DAPP_CONNECT", "Connect to wc:abc123"]
+      ["PRIVATE_PAYOUT", "Private payout 10 USDC to 0xabc…"]
     ]);
   }
 
   private async populateTransactionsTab(docId: string, tabId: string): Promise<void> {
-    await this.insertTextAtEnd(docId, tabId, `📊 ${TAB_NAMES.TRANSACTIONS}\nComplete transaction history with on-chain receipts.\n\n▸ TRANSACTION HISTORY\n`);
-    await this.insertTableAtEnd(docId, tabId, [...TX_HISTORY_HEADERS], createRows(80, TX_HISTORY_HEADERS.length, EMPTY_TOKEN));
+    await this.insertTextAtEnd(docId, tabId, `📊 ${TAB_NAMES.TRANSACTIONS}\nOn-chain transaction history and tool execution evidence.\n\n▸ TRANSACTION HISTORY\n`);
+    await this.insertTableAtEnd(docId, tabId, [...TX_HISTORY_HEADERS], createRows(10, TX_HISTORY_HEADERS.length, EMPTY_TOKEN));
     await this.insertTextAtEnd(docId, tabId, "\n▸ TOOL CHAIN EVIDENCE\n");
-    await this.insertTableAtEnd(docId, tabId, [...TOOL_CHAIN_HEADERS], createRows(80, TOOL_CHAIN_HEADERS.length, EMPTY_TOKEN));
-  }
-
-  private async populateConnectTab(docId: string, tabId: string): Promise<void> {
-    await this.insertTextAtEnd(docId, tabId, `🔗 ${TAB_NAMES.CONNECT}\nClick the URI link to connect your wallet, or paste a dApp URI below.\n\n▸ CONNECTION STATUS\n`);
-    await this.insertTableAtEnd(docId, tabId, [...CONNECT_STATUS_HEADERS], [
-      ["Status", "DISCONNECTED"],
-      ["Wallet Address", "None"],
-      ["Network", `Base Sepolia (${this.config.BASE_CHAIN_ID})`],
-      ["Connected At", "N/A"]
-    ]);
-    await this.insertTextAtEnd(docId, tabId, "\n▸ WALLETCONNECT URI (Click to Connect)\n");
-    await this.insertTableAtEnd(docId, tabId, [...CONNECT_URI_HEADERS], [[""]]);
-    await this.insertTextAtEnd(docId, tabId, "\n▸ OR PASTE DAPP URI HERE\n");
-    await this.insertTableAtEnd(docId, tabId, [...CONNECT_PASTE_HEADERS], [[""]]);
+    await this.insertTableAtEnd(docId, tabId, [...TOOL_CHAIN_HEADERS], createRows(10, TOOL_CHAIN_HEADERS.length, EMPTY_TOKEN));
   }
 
   private async populatePendingTab(docId: string, tabId: string): Promise<void> {
-    await this.insertTextAtEnd(docId, tabId, `⏳ ${TAB_NAMES.PENDING}\nCheck the APPROVE checkbox to authorize transactions.\n\n▸ AWAITING APPROVAL\n`);
-    const awaitingRows = createRows(60, PENDING_AWAITING_HEADERS.length, EMPTY_TOKEN).map((row) => {
+    await this.insertTextAtEnd(docId, tabId, `⏳ ${TAB_NAMES.PENDING}\nTransactions awaiting your approval.\n\n▸ AWAITING APPROVAL\n`);
+    const awaitingRows = createRows(10, PENDING_AWAITING_HEADERS.length, EMPTY_TOKEN).map((row) => {
       const next = [...row];
       next[6] = "☐ APPROVE";
       return next;
@@ -776,14 +700,14 @@ export class GoogleDocService {
     await this.insertTableAtEnd(docId, tabId, [...PENDING_AWAITING_HEADERS], awaitingRows);
 
     await this.insertTextAtEnd(docId, tabId, "\n▸ AUTO-APPROVED (Under $5)\n");
-    await this.insertTableAtEnd(docId, tabId, [...PENDING_AUTO_HEADERS], createRows(60, PENDING_AUTO_HEADERS.length, EMPTY_TOKEN));
+    await this.insertTableAtEnd(docId, tabId, [...PENDING_AUTO_HEADERS], createRows(10, PENDING_AUTO_HEADERS.length, EMPTY_TOKEN));
   }
 
   private async populateLogsTab(docId: string, tabId: string): Promise<void> {
-    await this.insertTextAtEnd(docId, tabId, `🤖 ${TAB_NAMES.LOGS}\nFull audit trail of agent reasoning and execution.\n\n▸ EXECUTION LOG\n`);
-    await this.insertTableAtEnd(docId, tabId, [...LOG_EXECUTION_HEADERS], createRows(200, LOG_EXECUTION_HEADERS.length, EMPTY_TOKEN));
+    await this.insertTextAtEnd(docId, tabId, `🤖 ${TAB_NAMES.LOGS}\nAgent reasoning and execution audit trail.\n\n▸ EXECUTION LOG\n`);
+    await this.insertTableAtEnd(docId, tabId, [...LOG_EXECUTION_HEADERS], createRows(20, LOG_EXECUTION_HEADERS.length, EMPTY_TOKEN));
     await this.insertTextAtEnd(docId, tabId, "\n▸ AGENT REASONING\n");
-    await this.insertTableAtEnd(docId, tabId, [...LOG_REASONING_HEADERS], createRows(200, LOG_REASONING_HEADERS.length, EMPTY_TOKEN));
+    await this.insertTableAtEnd(docId, tabId, [...LOG_REASONING_HEADERS], createRows(20, LOG_REASONING_HEADERS.length, EMPTY_TOKEN));
   }
 
   private async insertTextAtEnd(docId: string, tabId: string, text: string): Promise<void> {
