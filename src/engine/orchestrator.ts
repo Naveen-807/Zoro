@@ -61,6 +61,12 @@ export class Orchestrator {
     const lines = await this.docService.listUserInputLines();
 
     for (const line of lines) {
+      // Dedup: skip if we already tried this exact text this session
+      const dedup = `row:${line.lineNo}:${line.raw.trim().toLowerCase()}`;
+      if (this.reportedInputIssues.has(dedup)) {
+        continue;
+      }
+
       await this.docService.updateCommandInputRow(line.lineNo, {
         status: "⏳ PARSING"
       });
@@ -71,28 +77,27 @@ export class Orchestrator {
         parsed = await parseWithLlm(line.raw, this.llmParser);
         cmdId = buildCmdIdFromParsed(parsed);
       } catch (error) {
-        const issueId = `${line.raw.trim().toLowerCase()}::${error instanceof Error ? error.message : String(error)}`;
-        if (this.reportedInputIssues.has(issueId)) {
-          continue;
-        }
-        this.reportedInputIssues.add(issueId);
+        this.reportedInputIssues.add(dedup);
 
         if (error instanceof MissingCommandFieldsError) {
           const missing = error.details.missing.join(",");
           const got = JSON.stringify(error.details.got);
+          const cmdType = error.details.commandType;
           await this.docService.appendAuditLine(
             `ZORO NEEDS_INFO missing=[${missing}] got=${got} example="${error.details.example}"`
           );
           await this.docService.updateCommandInputRow(line.lineNo, {
-            status: "❌ NEEDS_INFO"
+            command: cmdType !== "UNKNOWN" ? cmdType : "❓",
+            status: `❌ NEEDS_INFO: missing ${missing}`
           });
           continue;
         }
 
         const message = error instanceof Error ? error.message : String(error);
-        await this.docService.appendAuditLine(`ZORO NEEDS_INFO missing=[required_fields] error="${message}"`);
+        await this.docService.appendAuditLine(`ZORO PARSE_ERROR error="${message}"`);
         await this.docService.updateCommandInputRow(line.lineNo, {
-          status: "❌ NEEDS_INFO"
+          command: "❓",
+          status: `❌ PARSE_ERROR: ${message.slice(0, 60)}`
         });
         continue;
       }

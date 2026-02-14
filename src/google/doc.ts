@@ -256,25 +256,11 @@ export class GoogleDocService {
   async listUserInputLines(): Promise<DocCommandLine[]> {
     const rows = await this.readCommandInputTable();
     const ready = rows.filter((row) => this.isInputRowReady(row));
-    if (ready.length === 0 && rows.length > 0) {
-      // Log why no rows are ready
-      const nonEmpty = rows.filter(r => r.parameters.trim() && r.parameters.trim() !== EMPTY_TOKEN);
-      if (nonEmpty.length > 0) {
-        console.log(`[DocService] ⚠ ${nonEmpty.length} rows have params but none are ready:`);
-        for (const r of nonEmpty.slice(0, 3)) {
-          console.log(`[DocService]   → row ${r.rowIndex}: params="${r.parameters.slice(0, 50)}" status="${r.status}"`);
-        }
-      }
-    }
     return ready.map((row) => ({ raw: row.parameters.trim(), lineNo: row.rowIndex }));
   }
 
   async readCommandInputTable(): Promise<CommandInputRow[]> {
     const rows = await this.readTableRows(TAB_NAMES.CHAT, "💬", CHAT_INPUT_HEADERS);
-    console.log(`[DocService] readCommandInputTable: found ${rows.length} raw rows`);
-    if (rows.length > 0) {
-      console.log(`[DocService]   → first row: command="${rows[0]?.values[0]}" params="${rows[0]?.values[1]}" status="${rows[0]?.values[2]}"`);
-    }
     return rows.map((entry) => ({
       rowIndex: entry.rowIndex,
       command: entry.values[0] ?? "",
@@ -894,14 +880,56 @@ export class GoogleDocService {
       });
     } catch (batchErr) {
       const msg = batchErr instanceof Error ? batchErr.message : String(batchErr);
-      if (msg.includes("Invalid deletion range")) {
-        // Retry with insert-only (skip delete)
+      if (msg.includes("Invalid") || msg.includes("invalid")) {
+        // Indices may have gone stale — re-fetch and retry
+        try {
+          const freshDoc = await docs.documents.get({ documentId: activeDocId, includeTabsContent: true });
+          const freshTab = findTab(freshDoc.data.tabs, tabNameFragment, emoji);
+          const freshTable = this.findTableByHeaders(freshTab, headers);
+          if (freshTable) {
+            const freshCell = freshTable.table.tableRows?.[rowIndex]?.tableCells?.[columnIndex];
+            if (freshCell) {
+              const freshRange = getWritableCellRange(freshCell, freshTable.tabId);
+              const retryReqs: docs_v1.Schema$Request[] = [];
+              if (freshRange.deleteEnd > freshRange.deleteStart && freshRange.deleteStart >= 1) {
+                retryReqs.push({
+                  deleteContentRange: {
+                    range: {
+                      startIndex: freshRange.deleteStart,
+                      endIndex: freshRange.deleteEnd,
+                      tabId: freshRange.tabId
+                    }
+                  }
+                });
+              }
+              retryReqs.push({
+                insertText: {
+                  location: { index: freshRange.insertIndex, tabId: freshRange.tabId },
+                  text
+                }
+              });
+              await docs.documents.batchUpdate({
+                documentId: activeDocId,
+                requestBody: { requests: retryReqs }
+              });
+              return;
+            }
+          }
+        } catch {
+          // Last resort: insert-only at fresh index
+        }
+        // Final fallback: re-fetch and insert at cell start
+        const lastDoc = await docs.documents.get({ documentId: activeDocId, includeTabsContent: true });
+        const lastTab = findTab(lastDoc.data.tabs, tabNameFragment, emoji);
+        const lastTable = this.findTableByHeaders(lastTab, headers);
+        const lastCell = lastTable?.table.tableRows?.[rowIndex]?.tableCells?.[columnIndex];
+        const insertIdx = lastCell?.content?.[0]?.startIndex ?? range.insertIndex;
         await docs.documents.batchUpdate({
           documentId: activeDocId,
           requestBody: {
             requests: [{
               insertText: {
-                location: { index: range.insertIndex, tabId: ensured.tabId },
+                location: { index: insertIdx, tabId: range.tabId },
                 text
               }
             }]
@@ -1196,12 +1224,24 @@ export class GoogleDocService {
     if (status.includes("parsing")) {
       return false;
     }
+    // Skip rows that failed to parse — user needs to fix them
+    if (status.includes("needs_info") || status.includes("parse_error")) {
+      return false;
+    }
     // Skip rows that have already been processed to a terminal state
-    // (but NOT "executing" — those may be stale from a DB reset and need re-ingestion)
     if (status.includes("cmd_") && (
       status.includes("done") ||
       status.includes("failed") ||
       status.includes("aborted")
+    )) {
+      return false;
+    }
+    // Skip rows already processing (have a cmd_ id assigned)
+    if (status.includes("cmd_") && (
+      status.includes("approved") ||
+      status.includes("executing") ||
+      status.includes("awaiting") ||
+      status.includes("intent")
     )) {
       return false;
     }
@@ -1309,12 +1349,27 @@ function getWritableCellRange(cell: docs_v1.Schema$TableCell, tabId: string): {
   deleteEnd: number;
   tabId: string;
 } {
-  const start = cell.content?.[0]?.startIndex ?? 1;
-  const end = (cell.content?.at(-1)?.endIndex ?? start + 1) - 1;
+  const paras = cell.content ?? [];
+  const firstStart = paras[0]?.startIndex ?? 1;
+  // The endIndex of the last content element includes a trailing newline that
+  // belongs to the cell structure, not the user text. We need to delete up to
+  // but not including that trailing newline.
+  let textEnd = firstStart;
+  for (const para of paras) {
+    const elements = para.paragraph?.elements ?? [];
+    for (const el of elements) {
+      const run = el.textRun?.content ?? "";
+      // skip pure newlines at the end — they're structural
+      const trimmed = run.replace(/\n$/g, "");
+      if (trimmed.length > 0 && el.endIndex) {
+        textEnd = (el.startIndex ?? firstStart) + trimmed.length;
+      }
+    }
+  }
   return {
-    insertIndex: start,
-    deleteStart: start,
-    deleteEnd: Math.max(start, end),
+    insertIndex: firstStart,
+    deleteStart: firstStart,
+    deleteEnd: Math.max(firstStart, textEnd),
     tabId
   };
 }

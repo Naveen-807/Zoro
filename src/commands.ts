@@ -195,6 +195,7 @@ export function parseInboxCommand(input: string): ParsedCommand {
   const trimmed = input.trim();
   const lowered = trimmed.toLowerCase();
 
+  // Direct prefix matches
   if (lowered.startsWith("pay ")) {
     return parsePayVendorInbox(trimmed);
   }
@@ -208,6 +209,17 @@ export function parseInboxCommand(input: string): ParsedCommand {
     return parseRecurringPayInbox(trimmed);
   }
 
+  // Natural language: detect intent keywords anywhere in the text
+  if (/\bpay\b/i.test(lowered) && /\busdc\b/i.test(lowered) && /0x[a-fA-F0-9]{40}/.test(trimmed)) {
+    return parsePayVendorInbox(trimmed);
+  }
+  if (/\b(swap|convert|exchange|trade)\b/i.test(lowered) && /\busdc\b/i.test(lowered)) {
+    return parseSwapInbox(trimmed);
+  }
+  if (/\bprivate\b/i.test(lowered) && /\bpayout\b/i.test(lowered)) {
+    return parsePrivatePayoutInbox(trimmed);
+  }
+
   throw new MissingCommandFieldsError({
     commandType: "UNKNOWN",
     missing: ["action"],
@@ -217,19 +229,20 @@ export function parseInboxCommand(input: string): ParsedCommand {
 }
 
 function parsePayVendorInbox(input: string): ParsedCommand {
-  const vendorToken = input.match(/^pay\s+([^\s]+)/i)?.[1];
+  // Try to extract vendor name: look for word after "pay" that isn't a number or address
+  const vendorMatch = input.match(/\bpay\s+([a-zA-Z][a-zA-Z0-9_-]*)/i);
+  const vendorToken = vendorMatch?.[1];
   const amount = readNumber(input, /\b([0-9]+(?:\.[0-9]+)?)\s*usdc\b/i);
-  const toCandidate = input.match(/\bto\s+([^\s]+)/i)?.[1];
+  const toCandidate = input.match(/\bto\s+(0x[a-fA-F0-9]{40})/i)?.[1]
+    ?? input.match(/(0x[a-fA-F0-9]{40})/)?.[1];
   const dataBudget = readNumber(input, /\btool\s+budget\s+([0-9]+(?:\.[0-9]+)?)\b/i);
   const totalCap = readNumber(input, /\btotal\s+cap\s+([0-9]+(?:\.[0-9]+)?)\b/i);
 
-  const vendor = vendorToken && !isNumericToken(vendorToken) ? vendorToken : undefined;
+  const vendor = vendorToken && !isNumericToken(vendorToken) && !ETH_ADDRESS_REGEX.test(vendorToken) ? vendorToken : undefined;
   const to = toCandidate && ETH_ADDRESS_REGEX.test(toCandidate) ? toCandidate : undefined;
   const missing: string[] = [];
 
-  if (!vendor) {
-    missing.push("vendor");
-  }
+  // Vendor is optional for natural language — default to recipient address prefix
   if (typeof amount !== "number") {
     missing.push("amount_usdc");
   }
@@ -252,7 +265,7 @@ function parsePayVendorInbox(input: string): ParsedCommand {
 
   return {
     kind: "PAY_VENDOR",
-    vendor: vendor!,
+    vendor: vendor ?? to!.slice(0, 8).toUpperCase(),
     amountUsdc: amount!,
     to: to!,
     dataBudgetUsdc: dataBudget,
