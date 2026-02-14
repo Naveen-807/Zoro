@@ -21,7 +21,12 @@ Thumbs.db
 
 # Private development artifacts (user request)
 plans/
-# Sensitive judge/demo docs (do NOT push)
+# Ignore all Markdown files in the repo EXCEPT the public README.md
+# (keeps plans, docs and notes out of git history)
+**/*.md
+!README.md
+
+# Sensitive judge/demo docs (do NOT push)  — already covered by the rule above
 docs/winning-strategy.md
 docs/hackathon-evaluation.md
 docs/project-analysis.md
