@@ -1,14 +1,16 @@
 import { Hono } from "hono";
 import { serve } from "@hono/node-server";
 import type { Orchestrator } from "../engine/orchestrator.js";
+import type { CdpWalletService } from "../x402/cdp.js";
 import type { AppConfig } from "../config.js";
 
 export type HttpServerDeps = {
   orchestrator: Orchestrator;
+  cdpWallet: CdpWalletService;
   config: AppConfig;
 };
 
-export function startHttpServer({ orchestrator, config }: HttpServerDeps): { close: () => Promise<void> } {
+export function startHttpServer({ orchestrator, cdpWallet, config }: HttpServerDeps): { close: () => Promise<void> } {
   const app = new Hono();
 
   app.get("/", async (c) => {
@@ -46,6 +48,24 @@ export function startHttpServer({ orchestrator, config }: HttpServerDeps): { clo
     const cmdId = c.req.param("cmdId");
     await orchestrator.simulateAbort(docId, cmdId);
     return c.json({ ok: true, docId, cmdId });
+  });
+
+  // ── Wallet / Treasury ─────────────────────────────────────────────────────
+  app.get("/api/wallet/info", async (c) => {
+    try {
+      const address = await cdpWallet.getAddress();
+      const balances = await cdpWallet.getBalances().catch(() => []);
+      return c.json({
+        ok: true,
+        address,
+        chain: config.X402_CHAIN,
+        balances,
+        authMethod: "cdp-wallet-eip712"
+      });
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : String(err);
+      return c.json({ ok: false, error: msg }, 503);
+    }
   });
 
   app.get("/api/ap2/cmd/:docId/:cmdId", (c) => {
@@ -121,7 +141,7 @@ export function startHttpServer({ orchestrator, config }: HttpServerDeps): { clo
       _meta: {
         exportedAt: new Date().toISOString(),
         hackathon: "San Francisco Agentic Commerce x402 Hackathon",
-        tracks: ["Overall Best Agent", "x402 Tool Usage", "AP2 Integration", "DeFi Agent"]
+        tracks: ["Overall Best Agent", "x402 Tool Usage", "AP2 Integration", "DeFi Agent", "Encrypted Agents"]
       },
 
       // ─── Overall: End-to-end workflow ───────────────────────────────────────
@@ -202,6 +222,25 @@ export function startHttpServer({ orchestrator, config }: HttpServerDeps): { clo
           maxSpendUsdc: (command.parsed as any)?.maxSpendUsdc
         }
       } : null,
+
+      // ─── Encrypted Agents Track: BITE v2 ───────────────────────────────────
+      encrypted: command?.parsed?.kind === "PRIVATE_PAYOUT" ? (() => {
+        const encryptedJob = orchestrator.getEncryptedJob(docId, cmdId);
+        const encryptedReceipts = trace.ap2Receipts.filter(r => r.kind === "ENCRYPTED");
+        return {
+          status: encryptedJob?.status ?? "NOT_STARTED",
+          jobId: encryptedJob?.jobId ?? null,
+          condition: encryptedJob ? JSON.parse(encryptedJob.conditionJson) : null,
+          txHash: encryptedJob?.txHash ?? null,
+          privacyProperties: {
+            encryption: "BLS threshold encryption via @skalenetwork/bite",
+            hiddenData: "Recipient address, transfer amount, ERC-20 calldata",
+            decryptionAuthority: "SKALE validator network (≥2/3 honest majority threshold)",
+            unlockMechanism: "Time-based condition — decryption only after specified UTC timestamp"
+          },
+          receipts: encryptedReceipts
+        };
+      })() : null,
 
       // ─── Agent reasoning trace ──────────────────────────────────────────────
       agentReasoning: {

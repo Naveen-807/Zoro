@@ -77,8 +77,7 @@ export class TreasuryService {
 
     private async getWalletAddress(): Promise<string | null> {
         try {
-            const wallet = await this.cdpWallet.getOrCreateWallet();
-            return (wallet as any)?.defaultAddress?.addressId ?? (wallet as any)?.address ?? null;
+            return await this.cdpWallet.getAddress();
         } catch {
             return null;
         }

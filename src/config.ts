@@ -125,9 +125,6 @@ export function validateStrictLiveConfig(config: AppConfig): string[] {
   if (!config.GOOGLE_SERVICE_ACCOUNT_JSON) {
     missing.push("GOOGLE_SERVICE_ACCOUNT_JSON");
   }
-  if (!config.WC_PROJECT_ID) {
-    missing.push("WC_PROJECT_ID");
-  }
   if (!config.CDP_API_KEY_ID && !config.CDP_API_KEY_NAME) {
     missing.push("CDP_API_KEY_ID (or CDP_API_KEY_NAME)");
   }

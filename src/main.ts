@@ -127,6 +127,7 @@ async function main(): Promise<void> {
 
   const httpServer = startHttpServer({
     orchestrator,
+    cdpWallet,
     config
   });
 
