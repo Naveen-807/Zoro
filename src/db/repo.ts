@@ -346,6 +346,31 @@ export class Repo {
     return row ?? null;
   }
 
+  listAgentThoughts(docId: string, limit = 20): AP2Receipt[] {
+    const rows = this.db
+      .prepare(
+        `SELECT receipt_json FROM ap2_receipts
+         WHERE doc_id = ?
+           AND kind IN ('AGENT_PLAN', 'AGENT_REFLECTION', 'TOOL_CHAIN', 'AGENT_GOAL')
+         ORDER BY created_at DESC
+         LIMIT ?`
+      )
+      .all(docId, limit) as Array<{ receipt_json: string }>;
+    return rows.map((row) => JSON.parse(row.receipt_json) as AP2Receipt);
+  }
+
+  getCurrentGoal(docId: string): AP2Receipt | null {
+    const row = this.db
+      .prepare(
+        `SELECT receipt_json FROM ap2_receipts
+         WHERE doc_id = ? AND kind = 'AGENT_GOAL'
+         ORDER BY created_at DESC
+         LIMIT 1`
+      )
+      .get(docId) as { receipt_json: string } | undefined;
+    return row ? (JSON.parse(row.receipt_json) as AP2Receipt) : null;
+  }
+
   getTrace(docId: string, cmdId: string): {
     command: CommandRecord | null;
     intent: AP2IntentMandate | null;

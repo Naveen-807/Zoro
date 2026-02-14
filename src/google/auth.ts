@@ -56,3 +56,20 @@ export function ensureSecretDirs(_config: AppConfig): void {
     // No secret dirs needed for service account flow.
     // Kept for backward compatibility with main.ts.
 }
+
+/**
+ * Returns the service account email from config (for sharing docs).
+ * Returns null if not configured.
+ */
+export function getServiceAccountEmail(config: AppConfig): string | null {
+    const jsonSource = config.GOOGLE_SERVICE_ACCOUNT_JSON;
+    if (!jsonSource) return null;
+    try {
+        const credentials = jsonSource.trim().startsWith("{")
+            ? JSON.parse(jsonSource)
+            : JSON.parse(fs.readFileSync(path.resolve(jsonSource), "utf8"));
+        return credentials?.client_email ?? null;
+    } catch {
+        return null;
+    }
+}

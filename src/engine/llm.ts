@@ -47,6 +47,10 @@ RULES:
 
 export class LlmIntentParser {
     private model: ReturnType<GoogleGenerativeAI["getGenerativeModel"]> | null = null;
+    /** Timestamp (ms) until which we should skip Gemini calls after a 429 */
+    private rateLimitUntil = 0;
+    /** Inputs we already failed to parse — don't retry the same text */
+    private failedInputs = new Set<string>();
 
     constructor(apiKey?: string) {
         if (apiKey) {
@@ -59,11 +63,25 @@ export class LlmIntentParser {
     }
 
     get isAvailable(): boolean {
-        return this.model !== null;
+        if (!this.model) return false;
+        // Temporarily unavailable during rate-limit backoff
+        if (Date.now() < this.rateLimitUntil) return false;
+        return true;
     }
 
     async parseIntent(input: string): Promise<ParsedCommand | null> {
         if (!this.model) return null;
+
+        // Skip if we're in a rate-limit backoff window
+        if (Date.now() < this.rateLimitUntil) {
+            return null;
+        }
+
+        // Don't re-attempt inputs that already failed (UNKNOWN / missing fields)
+        const inputKey = input.trim().toLowerCase();
+        if (this.failedInputs.has(inputKey)) {
+            return null;
+        }
 
         try {
             const result = await this.model.generateContent({
@@ -129,9 +147,21 @@ export class LlmIntentParser {
             }
 
             console.log(`[LLM] Unknown kind: ${parsed.kind}`);
+            this.failedInputs.add(inputKey);
             return null;
         } catch (error) {
             const msg = error instanceof Error ? error.message : String(error);
+
+            // Detect 429 rate limit and set backoff
+            if (msg.includes("429") || msg.includes("Too Many Requests") || msg.includes("quota")) {
+                // Extract retry delay from error message (e.g. "Please retry in 43.973s")
+                const retryMatch = msg.match(/retry in ([\d.]+)s/i);
+                const delaySec = retryMatch?.[1] ? Math.ceil(parseFloat(retryMatch[1])) : 60;
+                this.rateLimitUntil = Date.now() + delaySec * 1000;
+                console.log(`[LLM] ⚠ Rate limited — backing off ${delaySec}s (until ${new Date(this.rateLimitUntil).toISOString()})`);
+                return null;
+            }
+
             console.log(`[LLM] Parse error: ${msg}`);
             return null;
         }

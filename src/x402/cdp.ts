@@ -1,6 +1,4 @@
-import { randomBytes } from "crypto";
 import { createPublicClient, http } from "viem";
-import { privateKeyToAccount } from "viem/accounts";
 import { base, baseSepolia } from "viem/chains";
 import type { AppConfig } from "../config.js";
 
@@ -33,14 +31,9 @@ export class CdpWalletService {
 
     const client = await this.getClient();
     if (!client) {
-      if (this.config.STRICT_LIVE_MODE === 1) {
-        throw new Error("CDP client unavailable in strict live mode");
-      }
-      this.cached = {
-        walletId: this.config.X402_BUYER_ACCOUNT_NAME,
-        address: "0x000000000000000000000000000000000000dEaD"
-      };
-      return this.cached;
+      throw new Error(
+        "CDP client unavailable. Configure CDP_API_KEY_ID (or CDP_API_KEY_NAME), CDP_API_KEY_SECRET (or CDP_API_KEY_PRIVATE_KEY), and CDP_WALLET_SECRET."
+      );
     }
 
     const accountName = this.config.X402_BUYER_ACCOUNT_NAME || this.config.X402_BUYER_WALLET_ID || "zoro-buyer";
@@ -71,26 +64,6 @@ export class CdpWalletService {
   }
 
   async getX402ClientSigner(): Promise<X402ClientSigner> {
-    // In simulated mode without CDP credentials, use a random viem signer
-    if (this.config.STRICT_LIVE_MODE !== 1 && !this.evmAccount) {
-      await this.getOrCreateWallet(); // ensure cached wallet exists
-      if (!this.evmAccount) {
-        const pk = `0x${randomBytes(32).toString("hex")}` as `0x${string}`;
-        const viemAccount = privateKeyToAccount(pk);
-        return {
-          address: viemAccount.address,
-          signTypedData: async (typedData) => {
-            return viemAccount.signTypedData({
-              domain: typedData.domain as any,
-              types: typedData.types as any,
-              primaryType: typedData.primaryType,
-              message: typedData.message
-            });
-          }
-        };
-      }
-    }
-
     const account = await this.getServerAccount();
     const address = (await this.getAddress()) as `0x${string}`;
 
@@ -120,10 +93,7 @@ export class CdpWalletService {
     const account = await this.getNetworkAccount(this.config.X402_CHAIN);
 
     if (typeof account?.listTokenBalances !== "function") {
-      if (this.config.STRICT_LIVE_MODE === 1) {
-        throw new Error("CDP account missing listTokenBalances action");
-      }
-      return [{ asset: "USDC", amount: "0" }];
+      throw new Error("CDP account missing listTokenBalances action");
     }
 
     const raw = await account.listTokenBalances({});
@@ -155,19 +125,18 @@ export class CdpWalletService {
   }
 
   async sendSettlement(to: string, amountUsdc: number): Promise<string> {
-    if (this.config.STRICT_LIVE_MODE !== 1) {
-      const { randomBytes } = await import("crypto");
-      return `0x${randomBytes(32).toString("hex")}`;
-    }
-
     const account = await this.getNetworkAccount(this.config.X402_CHAIN);
     if (typeof account?.transfer !== "function") {
       throw new Error("CDP account does not support transfer action");
     }
 
+    // Convert human-readable USDC amount to atomic units (6 decimals)
+    // e.g. 0.002 USDC → 2000 atomic units
+    const atomicAmount = BigInt(Math.round(amountUsdc * 1_000_000));
+
     const result = await account.transfer({
       to,
-      amount: amountUsdc,
+      amount: atomicAmount,
       token: this.config.BASE_USDC_ADDRESS
     });
 
@@ -181,15 +150,7 @@ export class CdpWalletService {
   async waitForSettlement(
     txHash: string,
     confirmations = 1
-  ): Promise<{ transactionHash: string; status: "success" | "reverted"; blockNumber: bigint | null }> {
-    if (this.config.STRICT_LIVE_MODE !== 1) {
-      return {
-        transactionHash: txHash,
-        status: "success",
-        blockNumber: null
-      };
-    }
-
+  ): Promise<{ transactionHash: string; status: "success" | "reverted"; blockNumber: bigint | null; confirmations: number }> {
     if (!this.config.BASE_RPC_URL) {
       throw new Error("BASE_RPC_URL is required for settlement confirmation");
     }
@@ -208,7 +169,8 @@ export class CdpWalletService {
     return {
       transactionHash: receipt.transactionHash,
       status: receipt.status,
-      blockNumber: receipt.blockNumber
+      blockNumber: receipt.blockNumber,
+      confirmations
     };
   }
 

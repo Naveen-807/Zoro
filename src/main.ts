@@ -1,7 +1,7 @@
-import { getConfig, validateStrictLiveConfig } from "./config.js";
+import { getConfig, validateNoMockConfig, validateStrictLiveConfig } from "./config.js";
 import { createDb, runMigrations } from "./db/db.js";
 import { Repo } from "./db/repo.js";
-import { getGoogleAuth, ensureSecretDirs } from "./google/auth.js";
+import { getGoogleAuth, getServiceAccountEmail, ensureSecretDirs } from "./google/auth.js";
 import { GoogleDocService } from "./google/doc.js";
 import { WalletConnectService } from "./wc/walletconnect.js";
 import { CdpWalletService } from "./x402/cdp.js";
@@ -18,12 +18,24 @@ import { AgentMemory } from "./engine/memory.js";
 
 async function main(): Promise<void> {
   const config = getConfig();
+  const noMockMissing = validateNoMockConfig(config);
+  if (noMockMissing.length > 0) {
+    throw new Error(
+      `NO_MOCK_MODE=1 but required config is missing: ${noMockMissing.join(", ")}`
+    );
+  }
+
   const strictMissing = validateStrictLiveConfig(config);
   if (strictMissing.length > 0) {
     throw new Error(
       `STRICT_LIVE_MODE=1 but required config is missing: ${strictMissing.join(", ")}`
     );
   }
+
+  if (config.STRICT_LIVE_MODE === 1 && config.TESTNET_ONLY === 1 && config.BASE_RPC_URL) {
+    await assertBaseSepoliaRpc(config.BASE_RPC_URL);
+  }
+
   ensureSecretDirs(config);
 
   const db = createDb(config);
@@ -45,7 +57,7 @@ async function main(): Promise<void> {
     docId: config.GOOGLE_DOC_ID,
     auth: googleAuth,
     config,
-    fallbackFile: config.STRICT_LIVE_MODE === 1 ? undefined : "./data/local-doc.txt"
+    fallbackFile: "./data/local-doc.txt"
   });
 
   // Create or validate the template doc (falls back to local-doc if Google API fails)
@@ -54,11 +66,10 @@ async function main(): Promise<void> {
     docId = await docService.ensureTemplate();
   } catch (error) {
     const msg = error instanceof Error ? error.message : String(error);
-    if (config.STRICT_LIVE_MODE === 1) {
-      throw new Error(`Google Doc template creation failed in strict mode: ${msg}`);
-    }
+    const saEmail = getServiceAccountEmail(config);
     console.warn(`⚠ Google Doc creation failed (using local fallback): ${msg}`);
-    console.warn(`  → Tip: Enable the Google Docs API and Google Drive API at https://console.cloud.google.com/apis/library`);
+    console.warn(`  → Share your doc with ${saEmail ?? "your service account"} as Editor, then set GOOGLE_DOC_ID in .env`);
+    console.warn(`  → Ensure Google Docs API and Drive API are enabled at https://console.cloud.google.com/apis/library`);
     docId = "local-doc";
   }
   console.log(`Doc ID: ${docId}`);
@@ -108,7 +119,13 @@ async function main(): Promise<void> {
     port: config.TOOLS_PORT,
     sellerAddress: config.X402_SELLER_ADDRESS ?? "0x000000000000000000000000000000000000dEaD",
     chain: config.X402_CHAIN,
-    facilitatorUrl: config.X402_FACILITATOR_URL
+    facilitatorUrl: config.X402_FACILITATOR_URL,
+    strictLiveMode: config.STRICT_LIVE_MODE,
+    noMockMode: config.NO_MOCK_MODE,
+    baseRpcUrl: config.BASE_RPC_URL,
+    baseUsdcAddress: config.BASE_USDC_ADDRESS,
+    trmSanctionsApiKey: config.TRM_SANCTIONS_API_KEY,
+    trmSanctionsApiUrl: config.TRM_SANCTIONS_API_URL
   });
 
   const httpServer = startHttpServer({
@@ -116,6 +133,14 @@ async function main(): Promise<void> {
     walletConnect,
     config
   });
+
+  if (config.STRICT_LIVE_MODE === 1) {
+    console.log("══════════════════════════════════════════════════════════");
+    console.log("ZORO LIVE MODE");
+    console.log(`NO_MOCK_MODE=${config.NO_MOCK_MODE === 1 ? "ON" : "OFF"} | TESTNET_ONLY=${config.TESTNET_ONLY === 1 ? "ON" : "OFF"}`);
+    console.log(`CHAIN=${config.X402_CHAIN} | FACILITATOR=${config.X402_FACILITATOR_URL ?? "unset"}`);
+    console.log("══════════════════════════════════════════════════════════");
+  }
 
   console.log(`Zoro API: http://localhost:${config.PORT}`);
   console.log(`Zoro paid tools: http://localhost:${config.TOOLS_PORT}`);
@@ -129,15 +154,16 @@ async function main(): Promise<void> {
     }
   }, config.POLL_INTERVAL_MS);
 
-  const shutdown = async () => {
+  const shutdown = async (signal?: string) => {
+    console.log(`[Zoro] Shutting down (${signal ?? "unknown"})...`);
     clearInterval(interval);
     await Promise.all([httpServer.close(), toolServer.close()]);
     db.close();
     process.exit(0);
   };
 
-  process.on("SIGINT", shutdown);
-  process.on("SIGTERM", shutdown);
+  process.on("SIGINT", () => shutdown("SIGINT"));
+  process.on("SIGTERM", () => shutdown("SIGTERM"));
 }
 
 main().catch((error) => {
@@ -145,3 +171,29 @@ main().catch((error) => {
   console.error(message);
   process.exit(1);
 });
+
+async function assertBaseSepoliaRpc(rpcUrl: string): Promise<void> {
+  const response = await fetch(rpcUrl, {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({
+      jsonrpc: "2.0",
+      id: 1,
+      method: "eth_chainId",
+      params: []
+    })
+  });
+  if (!response.ok) {
+    throw new Error(`Failed to query BASE_RPC_URL chain id (${response.status})`);
+  }
+
+  const payload = (await response.json()) as { result?: string; error?: { message?: string } };
+  if (payload.error?.message) {
+    throw new Error(`BASE_RPC_URL chain id query failed: ${payload.error.message}`);
+  }
+
+  const chainIdHex = (payload.result ?? "").toLowerCase();
+  if (chainIdHex !== "0x14a34") {
+    throw new Error(`BASE_RPC_URL is not Base Sepolia (expected 0x14a34, got ${chainIdHex || "unknown"})`);
+  }
+}

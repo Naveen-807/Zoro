@@ -6,6 +6,11 @@ type SwapRequest = {
   amountUsdc: number;
   slippageBps: number;
   maxSpendUsdc: number;
+  uniswapQuote?: {
+    pool: string;
+    feeTier: number;
+    router: string;
+  };
 };
 
 export type SwapResult = {
@@ -26,24 +31,11 @@ export class DefiSwapService {
     if (request.amountUsdc > request.maxSpendUsdc) {
       throw new Error("Swap amount exceeds max spend");
     }
-    if (request.slippageBps > 100) {
-      throw new Error("Slippage too high");
+    if (request.slippageBps > 200) {
+      throw new Error("Slippage too high (max 200 bps)");
     }
 
     const amount = parseUnits(request.amountUsdc.toString(), 6);
-
-    if (this.config.STRICT_LIVE_MODE !== 1) {
-      return {
-        txHash: `simulated_${Date.now()}`,
-        chain: this.config.X402_CHAIN,
-        venue: "cdp-swap-simulated",
-        reasonCodes: ["SIMULATED_TX", "SLIPPAGE_GUARDED"],
-        details: {
-          amountIn: amount.toString(),
-          slippageBps: request.slippageBps
-        }
-      };
-    }
 
     const networkAccount = await this.cdpWallet.getNetworkAccount(this.config.X402_CHAIN);
     if (typeof networkAccount?.swap !== "function") {
@@ -66,13 +58,16 @@ export class DefiSwapService {
     return {
       txHash,
       chain: this.config.X402_CHAIN,
-      venue: "cdp-swap",
+      venue: request.uniswapQuote ? "uniswap-v3" : "cdp-swap",
       reasonCodes: ["LIVE_SWAP_EXECUTED", "SLIPPAGE_GUARDED"],
       details: {
         amountIn: amount.toString(),
         slippageBps: request.slippageBps,
         fromToken: this.config.BASE_USDC_ADDRESS,
         toToken: this.config.WETH_ADDRESS,
+        pool: request.uniswapQuote?.pool,
+        feeTier: request.uniswapQuote?.feeTier,
+        router: request.uniswapQuote?.router,
         raw: swapResult
       }
     };

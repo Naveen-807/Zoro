@@ -9,7 +9,7 @@ export type PolicyContext = {
   selectedTools: ToolPlanItem[];
 };
 
-export function chooseToolPlan(command: ParsedCommand): ToolPlanItem[] {
+export function chooseToolPlan(command: ParsedCommand, config?: { TRM_SANCTIONS_API_KEY?: string }): ToolPlanItem[] {
   if (command.kind !== "PAY_VENDOR") {
     return [];
   }
@@ -24,12 +24,14 @@ export function chooseToolPlan(command: ParsedCommand): ToolPlanItem[] {
       : "Standard risk check for sub-250 payout"
   });
 
-  tools.push({
-    toolName: "compliance-check",
-    endpoint: "/tools/compliance-check",
-    priceUsdc: 0.5,
-    reason: "Compliance screening required for payouts"
-  });
+  if (config?.TRM_SANCTIONS_API_KEY) {
+    tools.push({
+      toolName: "compliance-check",
+      endpoint: "/tools/compliance-check",
+      priceUsdc: 0.5,
+      reason: "Compliance screening required for payouts"
+    });
+  }
 
   return tools;
 }

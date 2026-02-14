@@ -1,120 +1,94 @@
-# Zoro
+# Zoro — Approve Blockchain Transactions in Google Docs
 
-Zoro turns a Google Doc into an agentic commerce control panel:
+> **Check a checkbox. Sign a transaction. Done.**
 
-- User writes intent in the doc.
-- Agent parses, applies policy, and requests approval.
-- Agent pays for x402 tools, executes settlement/swap/encrypted flow.
-- Agent writes receipts and outcome back to the same doc.
+[![Demo Video](https://img.youtube.com/vi/VIDEO_ID/0.jpg)](https://youtube.com/watch?v=VIDEO_ID)
 
-## Implementation Status
+**[Try Live Demo](https://zoro-demo.fly.dev)** · **[Open Demo Doc](https://docs.google.com/document/d/DEMO_DOC_ID/edit)**
 
-| Component | Status | Notes |
-|---|---|---|
-| Google Doc ingest + audit writeback | Implemented | INBOX read, AUDIT receipts |
-| Natural language command parsing | Implemented | LLM + deterministic fallback |
-| AP2 intent/cart/payment mandates | Implemented | Typed-data signature verification |
-| WalletConnect approval | Implemented | Server-initiated signature flow |
-| x402 buyer flow | Implemented | Official `@x402/fetch` + CDP signer |
-| x402 seller middleware | Implemented | Official `@x402/hono` |
-| Paid tool chaining (>=2 steps) | Implemented | `vendor-risk` + `compliance-check` |
-| Spend ledger | Implemented | Per tool call, per command |
-| PAY_VENDOR settlement | Implemented | CDP transfer + tx confirmation lookup |
-| TREASURY_SWAP DeFi action | Implemented | CDP swap + paid pre-swap research |
-| BITE encrypted lifecycle | Implemented | Encrypt -> condition -> submit -> decrypt |
+## What It Does
 
-## Architecture
+Zoro turns a Google Doc into a wallet + agent console:
 
-```mermaid
-flowchart LR
-  D[Google Doc INBOX] --> O[Orchestrator]
-  O --> P[Policy Engine]
-  O --> A[AP2 Mandates]
-  A --> W[WalletConnect Signature]
-  O --> X[x402 Buyer]
-  X --> T[Paid Tools Server]
-  O --> C[CDP Wallet]
-  O --> S[Swap Service]
-  O --> B[BITE Service]
-  O --> R[(SQLite Receipts + Spend)]
-  O --> DA[Google Doc AUDIT]
-```
+- **Chat tab** ingests natural language commands.
+- **Pending tab** uses `☐ / ☑` approvals.
+- **Connect tab** manages WalletConnect URI and session state.
+- **Transactions tab** writes real transaction hashes with clickable BaseScan links.
+- **Agent Logs tab** records tool calls, approvals, execution events, and reasoning.
 
-## Hackathon Flow Mapping
+## End-to-End Flow
 
-### 1. x402 Track
+1. Type a command in **Chat**.
+2. Review pending intent in **Pending**.
+3. Check `☐ APPROVE` to authorize.
+4. Sign EIP-712 in your wallet.
+5. Watch status/receipts update in **Transactions** + **Logs**.
 
-- Uses CDP wallet signer for x402 exact scheme.
-- Handles `402 -> pay -> retry` per tool call.
-- Chains multiple paid tools in a single command.
-- Tracks spend and stores receipts.
+## Track Coverage
 
-### 2. AP2 Track
+### x402 Tool Payments
 
-- Creates intent mandate at ingestion.
-- Requests typed-data signature via WalletConnect.
-- Verifies signer before execution.
-- Persists mandates + receipts for auditability.
+| Tool | Price | Purpose |
+|---|---:|---|
+| `vendor-risk` | `$0.25` | On-chain risk signals |
+| `compliance-check` | `$0.50` | Sanctions screening |
+| `price-check` | `$0.10` | Pre-swap market data |
 
-### 3. DeFi Track
+### AP2 Authorization
 
-- Runs pre-trade paid `price-check` tool.
-- Enforces slippage and spend controls.
-- Executes on-chain swap and stores tx receipt.
+1. Intent mandate created from doc command.
+2. Checkbox approval triggers authorization request.
+3. WalletConnect prompts for signature.
+4. Signature verification gates execution.
 
-### 4. Encrypted Agents Track
+### DeFi
 
-- Creates encrypted transfer job.
-- Enforces time-based unlock condition.
-- Submits encrypted tx and fetches decrypted data.
+- Uniswap V3 quote data is logged (`pool`, `feeTier`, `router`).
+- Swap records include clickable tx explorer links.
 
-## Environment Variables
+### Encrypted
 
-### Core
+- BITE time-locked payout lifecycle (`created` → `submitted` → `decrypted`) is persisted in receipts/audit.
 
-- `STRICT_LIVE_MODE` (`1` live, `0` simulated)
-- `PORT`
-- `TOOLS_PORT`
-- `TOOLS_BASE_URL` (optional)
-- `DB_PATH`
-- `X402_CHAIN` (default: `base-sepolia`)
+## No-Mock Live Mode
 
-### Google
+`NO_MOCK_MODE=1` now hard-fails startup unless required upstream config is present.
 
-- `GOOGLE_DOC_ID`
-- `GOOGLE_SERVICE_ACCOUNT_JSON`
+Required when no-mock is enabled:
 
-### WalletConnect / AP2
-
-- `WC_PROJECT_ID`
-- `WC_RELAY_URL`
-- `AP2_CHAIN_ID`
-
-### CDP / Settlement
-
-- `CDP_API_KEY_ID` or `CDP_API_KEY_NAME`
-- `CDP_API_KEY_SECRET` or `CDP_API_KEY_PRIVATE_KEY`
-- `CDP_WALLET_SECRET`
-- `X402_BUYER_ACCOUNT_NAME`
 - `BASE_RPC_URL`
+- `TRM_SANCTIONS_API_KEY`
+- `X402_FACILITATOR_URL`
 - `BASE_USDC_ADDRESS`
 - `WETH_ADDRESS`
+- `UNISWAP_V3_FACTORY`
+- `UNISWAP_QUOTER_V2`
+- `UNISWAP_SWAP_ROUTER02`
 
-### x402 Policy
+Default facilitator:
 
-- `X402_MAX_PER_CMD_USDC`
-- `X402_DAILY_LIMIT_USDC`
-- `X402_REQUIRE_APPROVAL_ABOVE_USDC`
-- `AUTO_RUN_UNDER_USDC`
-- `X402_TOOL_ALLOWLIST` (default: `vendor-risk,compliance-check,price-check`)
+- `X402_FACILITATOR_URL=https://x402.org/facilitator`
 
-### SKALE / BITE
+## Run Locally
 
-- `SKALE_ENABLED`
-- `SKALE_RPC_URL`
-- `SKALE_CHAIN_ID`
-- `SKALE_USDC_ADDRESS`
-- `EXECUTOR_PRIVATE_KEY`
+```bash
+npm install
+npm run build
+npm test
+npm run dev
+```
+
+## Fly.io Deploy
+
+This repo includes `fly.toml` for app deployment.
+
+```bash
+fly launch --no-deploy
+fly secrets set GOOGLE_SERVICE_ACCOUNT_JSON="$(cat ./.secrets/google-service-account.json)"
+fly secrets set WC_PROJECT_ID=... CDP_API_KEY_ID=... CDP_API_KEY_SECRET=... CDP_WALLET_SECRET=...
+fly secrets set BASE_RPC_URL=... TRM_SANCTIONS_API_KEY=... X402_FACILITATOR_URL=https://x402.org/facilitator
+fly deploy
+```
 
 ## API Endpoints
 
@@ -123,28 +97,3 @@ flowchart LR
 - `GET /api/commands/:docId/:cmdId/trace`
 - `GET /api/spend-summary/:docId/:cmdId`
 - `GET /.well-known/tools`
-- `POST /tools/vendor-risk` (paid)
-- `POST /tools/compliance-check` (paid)
-- `POST /tools/price-check` (paid)
-
-## Run
-
-```bash
-npm install
-npm test
-npm run build
-npm run dev
-```
-
-## Demo Checklist
-
-1. `PAY_VENDOR`: show AP2 approval, two paid x402 calls, settlement tx, spend summary.
-2. `TREASURY_SWAP`: show paid `price-check`, swap tx hash, slippage controls.
-3. `PRIVATE_PAYOUT`: show encrypted job creation, unlock, submit, decrypt evidence.
-
-## Commands
-
-- `Pay ACME 200 USDC to 0x1111111111111111111111111111111111111111 tool budget 1 total cap 2`
-- `Swap 25 USDC to WETH slippage 50 max spend 30`
-- `Private payout 50 USDC to 0x2222222222222222222222222222222222222222 at 2026-02-13T12:00:00Z`
-

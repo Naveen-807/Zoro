@@ -21,9 +21,13 @@ Thumbs.db
 
 # Private development artifacts (user request)
 plans/
+# Sensitive judge/demo docs (do NOT push)
 docs/winning-strategy.md
 docs/hackathon-evaluation.md
 docs/project-analysis.md
+docs/competitive-analysis.md
+docs/judge-evaluation.md
+docs/transaction-troubleshooting.md
 *.md.tmp
 
 # Internal test suite (user request - "judges should not find")

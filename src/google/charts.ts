@@ -55,36 +55,49 @@ export function buildPriceChartUrl(opts: {
 }
 
 /**
- * Generate simulated 24h price data for a token.
- * Uses deterministic seed for consistent results within the same hour.
+ * Build a horizontal bar chart showing cost breakdown for a command
+ * (tool costs + settlement amount).
  */
-export function generateSimulatedPriceData(token: string, basePrice: number): {
-    prices: number[];
-    labels: string[];
-} {
-    const now = new Date();
-    const prices: number[] = [];
-    const labels: string[] = [];
+export function buildSpendChartUrl(opts: {
+    cmdId: string;
+    items: Array<{ label: string; amountUsdc: number }>;
+}): string {
+    const { cmdId, items } = opts;
+    const labels = items.map(i => i.label);
+    const data = items.map(i => i.amountUsdc);
+    const colors = items.map((_, idx) =>
+        idx === items.length - 1 ? "rgba(59,130,246,0.8)" : "rgba(139,92,246,0.8)"
+    );
 
-    for (let i = 23; i >= 0; i--) {
-        const t = new Date(now.getTime() - i * 3600_000);
-        labels.push(`${t.getUTCHours().toString().padStart(2, "0")}:00`);
+    const config = {
+        type: "horizontalBar" as const,
+        data: {
+            labels,
+            datasets: [{
+                label: "Cost (USDC)",
+                data,
+                backgroundColor: colors,
+                borderWidth: 0
+            }]
+        },
+        options: {
+            responsive: true,
+            plugins: {
+                title: {
+                    display: true,
+                    text: `${cmdId} — Spend Breakdown`,
+                    color: "#333",
+                    font: { size: 13, family: "Inter" }
+                },
+                legend: { display: false }
+            },
+            scales: {
+                x: { ticks: { color: "#888", callback: (v: number) => `$${v}` }, grid: { color: "rgba(0,0,0,0.05)" } },
+                y: { ticks: { color: "#555" }, grid: { display: false } }
+            }
+        }
+    };
 
-        // Deterministic variation based on token + hour
-        const seed = hashCode(`${token}:${t.toISOString().slice(0, 13)}`);
-        const variance = ((seed % 400) - 200) / 10000; // ±2%
-        prices.push(Number((basePrice * (1 + variance)).toFixed(2)));
-    }
-
-    return { prices, labels };
-}
-
-function hashCode(str: string): number {
-    let hash = 0;
-    for (let i = 0; i < str.length; i++) {
-        const char = str.charCodeAt(i);
-        hash = ((hash << 5) - hash) + char;
-        hash = hash & hash; // Convert to 32bit integer
-    }
-    return Math.abs(hash);
+    const encoded = encodeURIComponent(JSON.stringify(config));
+    return `https://quickchart.io/chart?c=${encoded}&w=500&h=220&bkg=white&f=png`;
 }

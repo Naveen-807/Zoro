@@ -17,9 +17,13 @@ import type { NotificationService } from "../notify/notify.js";
 import type { RecurringScheduler } from "./scheduler.js";
 import { AgentReasoner, type AgentPlan } from "./agent.js";
 import { AgentMemory } from "./memory.js";
+import { getUniswapQuote } from "../defi/uniswap.js";
+import { buildPriceChartUrl, buildSpendChartUrl } from "../google/charts.js";
+import { buildBaseAddressExplorerUrl, buildBaseTxExplorerUrl } from "../utils/explorer.js";
 
 export class Orchestrator {
   private readonly reportedInputIssues = new Set<string>();
+  private readonly reportedConnectionIssues = new Set<string>();
   private llmParser: LlmIntentParser | null = null;
   private notifier: NotificationService | null = null;
   private scheduler: RecurringScheduler | null = null;
@@ -60,6 +64,10 @@ export class Orchestrator {
     const lines = await this.docService.listUserInputLines();
 
     for (const line of lines) {
+      await this.docService.updateCommandInputRow(line.lineNo, {
+        status: "⏳ PARSING"
+      });
+
       let parsed: ParsedCommand;
       let cmdId: string;
       try {
@@ -78,16 +86,26 @@ export class Orchestrator {
           await this.docService.appendAuditLine(
             `ZORO NEEDS_INFO missing=[${missing}] got=${got} example="${error.details.example}"`
           );
+          await this.docService.updateCommandInputRow(line.lineNo, {
+            status: "❌ NEEDS_INFO"
+          });
           continue;
         }
 
         const message = error instanceof Error ? error.message : String(error);
         await this.docService.appendAuditLine(`ZORO NEEDS_INFO missing=[required_fields] error="${message}"`);
+        await this.docService.updateCommandInputRow(line.lineNo, {
+          status: "❌ NEEDS_INFO"
+        });
         continue;
       }
 
       const existing = this.repo.getCommand(docId, cmdId);
       if (existing) {
+        await this.docService.updateCommandInputRow(line.lineNo, {
+          command: existing.parsed.kind,
+          status: this.formatCommandStatus(existing.status, cmdId)
+        });
         continue;
       }
 
@@ -99,7 +117,19 @@ export class Orchestrator {
         status: "NEW"
       });
 
-      const tools = chooseToolPlan(parsed);
+      if (this.agent) {
+        const goal = this.agent.createGoalPlan(parsed);
+        this.repo.addAp2Receipt({
+          id: `receipt_${cmdId}_goal_created`,
+          docId,
+          cmdId,
+          kind: "AGENT_GOAL",
+          payload: goal,
+          createdAt: nowIso()
+        });
+      }
+
+      const tools = chooseToolPlan(parsed, this.config);
       const maxTotal = parsed.kind === "PAY_VENDOR" && parsed.maxTotalUsdc ? parsed.maxTotalUsdc : this.config.X402_MAX_PER_CMD_USDC;
       const intent = buildIntentMandate({
         docId,
@@ -113,6 +143,19 @@ export class Orchestrator {
 
       if (requiresApproval(this.config, parsed)) {
         this.repo.updateCommandStatus(docId, cmdId, "AWAITING_APPROVAL");
+        await this.docService.upsertPendingApproval({
+          cmdId,
+          intent: parsed.kind,
+          target: this.extractTarget(parsed),
+          volume: this.extractVolume(parsed),
+          risk: "MEDIUM",
+          status: "AWAITING_APPROVAL",
+          checkboxState: "UNCHECKED"
+        });
+        await this.docService.updateCommandInputRow(line.lineNo, {
+          command: parsed.kind,
+          status: this.formatCommandStatus("AWAITING_APPROVAL", cmdId)
+        });
         await this.docService.appendAuditLine(
           `ZORO ${cmdId} AWAITING_APPROVAL action=${parsed.kind} max_total=${maxTotal.toFixed(2)}USDC`
         );
@@ -123,9 +166,94 @@ export class Orchestrator {
         }
       } else {
         this.repo.updateCommandStatus(docId, cmdId, "APPROVED");
+        await this.docService.upsertPendingApproval({
+          cmdId,
+          intent: parsed.kind,
+          target: this.extractTarget(parsed),
+          volume: this.extractVolume(parsed),
+          risk: "LOW",
+          status: "APPROVED",
+          checkboxState: "CHECKED",
+          queue: "AUTO"
+        });
+        await this.docService.updateCommandInputRow(line.lineNo, {
+          command: parsed.kind,
+          status: this.formatCommandStatus("APPROVED", cmdId)
+        });
         await this.docService.appendAuditLine(
           `ZORO ${cmdId} AUTO_APPROVED action=${parsed.kind} auto_run_under=${this.config.AUTO_RUN_UNDER_USDC.toFixed(2)}USDC`
         );
+      }
+    }
+  }
+
+  async pollForWalletConnect(docId: string): Promise<void> {
+    try {
+      const pastedUri = await this.docService.readWalletConnectUri();
+      if (pastedUri) {
+        const pending = await this.wcService.connectFromUri(docId, pastedUri);
+        await this.docService.updateConnectionStatus({
+          state: pending.pending ? "CONNECTING" : "CONNECTED",
+          uri: pending.uri,
+          address: pending.address || undefined
+        });
+        await this.docService.clearWalletConnectUri();
+      }
+
+      const session = await this.wcService.syncSession(docId);
+      if (session?.pending) {
+        await this.docService.updateConnectionStatus({
+          state: "CONNECTING",
+          uri: session.uri
+        });
+        return;
+      }
+
+      if (session && !session.pending) {
+        await this.docService.updateConnectionStatus({
+          state: "CONNECTED",
+          uri: session.uri,
+          address: session.address,
+          connectedAt: nowIso()
+        });
+        return;
+      }
+
+      const uri = await this.wcService.generateConnectionUri(docId);
+      await this.docService.updateConnectionStatus({
+        state: "DISCONNECTED",
+        uri
+      });
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      if (!this.reportedConnectionIssues.has(message)) {
+        this.reportedConnectionIssues.add(message);
+        await this.docService.appendAuditLine(`ZORO CONNECT_ERROR message="${message}"`);
+      }
+    }
+  }
+
+  async pollForApprovals(docId: string): Promise<void> {
+    const pendingRows = await this.docService.readPendingApprovals();
+    for (const row of pendingRows) {
+      if (row.checkboxState !== "CHECKED") {
+        continue;
+      }
+      const command = this.repo.getCommand(docId, row.cmdId);
+      if (!command || command.status !== "AWAITING_APPROVAL") {
+        continue;
+      }
+      try {
+        const result = await this.requestApproval(docId, row.cmdId);
+        await this.docService.updatePendingStatus(row.cmdId, result.approved ? "APPROVED" : "FAILED");
+      } catch (error) {
+        const message = error instanceof Error ? error.message : String(error);
+        if (message.includes("pending approval") || message.includes("No WalletConnect session")) {
+          await this.docService.updatePendingStatus(row.cmdId, "AWAITING_APPROVAL");
+          continue;
+        }
+        await this.docService.updatePendingStatus(row.cmdId, "FAILED");
+        await this.docService.appendAuditLine(`ZORO ${row.cmdId} APPROVAL_FAILED reason="${message}"`);
       }
     }
   }
@@ -158,6 +286,7 @@ export class Orchestrator {
 
     if (!verification.valid || !verification.signerAddress) {
       this.repo.updateCommandStatus(docId, cmdId, "FAILED", "Authorization signature verification failed");
+      await this.docService.syncCommandStatusByCmdId(cmdId, "FAILED");
       return { approved: false, error: "Authorization signature verification failed" };
     }
 
@@ -185,6 +314,9 @@ export class Orchestrator {
     };
     this.repo.addAp2Receipt(approvalReceipt);
 
+    await this.docService.setApprovalCheckbox(cmdId, true);
+    await this.docService.updatePendingStatus(cmdId, "APPROVED");
+    await this.docService.syncCommandStatusByCmdId(cmdId, "APPROVED");
     await this.docService.appendAuditLine(`ZORO ${cmdId} APPROVED signer=${verification.signerAddress}`);
     return { approved: true, signer: verification.signerAddress };
   }
@@ -289,7 +421,22 @@ export class Orchestrator {
 
   private async executeCommand(command: CommandRecord): Promise<void> {
     this.repo.updateCommandStatus(command.docId, command.cmdId, "EXECUTING");
+    await this.docService.updatePendingStatus(command.cmdId, "EXECUTING");
+    await this.docService.syncCommandStatusByCmdId(command.cmdId, "EXECUTING");
     const startTime = Date.now();
+
+    if (this.agent) {
+      const goal = this.agent.createGoalPlan(command.parsed);
+      goal.status = "IN_PROGRESS";
+      this.repo.addAp2Receipt({
+        id: `receipt_${command.cmdId}_goal_in_progress`,
+        docId: command.docId,
+        cmdId: command.cmdId,
+        kind: "AGENT_GOAL",
+        payload: goal,
+        createdAt: nowIso()
+      });
+    }
 
     try {
       if (command.parsed.kind === "PAY_VENDOR") {
@@ -298,6 +445,14 @@ export class Orchestrator {
         await this.executeTreasurySwap(command);
       } else if (command.parsed.kind === "PRIVATE_PAYOUT") {
         await this.executePrivatePayout(command);
+      } else if (command.parsed.kind === "RECURRING_PAY") {
+        await this.executeRecurringPay(command);
+      }
+
+      const latest = this.repo.getCommand(command.docId, command.cmdId);
+      if (latest) {
+        await this.docService.updatePendingStatus(command.cmdId, latest.status);
+        await this.docService.syncCommandStatusByCmdId(command.cmdId, latest.status);
       }
 
       // Record successful outcome in agent memory
@@ -315,6 +470,21 @@ export class Orchestrator {
           toolsUsed: this.repo.listX402Receipts(command.docId, command.cmdId).map(r => r.toolName),
           totalCostUsdc: this.repo.getCommandSpend(command.docId, command.cmdId),
           durationMs: Date.now() - startTime
+        });
+      }
+
+      if (this.agent) {
+        const goal = this.agent.createGoalPlan(command.parsed);
+        goal.status = "COMPLETED";
+        goal.completedAt = nowIso();
+        goal.subGoals = goal.subGoals.map((subGoal) => ({ ...subGoal, status: "COMPLETED" }));
+        this.repo.addAp2Receipt({
+          id: `receipt_${command.cmdId}_goal_completed`,
+          docId: command.docId,
+          cmdId: command.cmdId,
+          kind: "AGENT_GOAL",
+          payload: goal,
+          createdAt: nowIso()
         });
       }
     } catch (error) {
@@ -344,6 +514,25 @@ export class Orchestrator {
           notes: message
         });
       }
+
+      if (this.agent) {
+        const goal = this.agent.createGoalPlan(command.parsed);
+        goal.status = "FAILED";
+        this.repo.addAp2Receipt({
+          id: `receipt_${command.cmdId}_goal_failed`,
+          docId: command.docId,
+          cmdId: command.cmdId,
+          kind: "AGENT_GOAL",
+          payload: {
+            ...goal,
+            error: message
+          },
+          createdAt: nowIso()
+        });
+      }
+
+      await this.docService.updatePendingStatus(command.cmdId, "FAILED");
+      await this.docService.syncCommandStatusByCmdId(command.cmdId, "FAILED");
     }
   }
 
@@ -383,7 +572,7 @@ export class Orchestrator {
       });
     } else {
       // Fallback to static rule-based tool selection
-      tools = chooseToolPlan(parsed);
+      tools = chooseToolPlan(parsed, this.config);
     }
 
     const estimated = tools.reduce((total, tool) => total + tool.priceUsdc, 0);
@@ -495,6 +684,12 @@ export class Orchestrator {
       if (!response.ok) {
         throw new Error(`${tool.toolName} failed with status ${response.status}`);
       }
+
+      await this.docService.appendToolChainRow({
+        tool: tool.toolName,
+        result: `HTTP ${receipt.retryStatus ?? response.status}`,
+        nextAction: toolStepIdx < tools.length ? `→ ${tools[toolStepIdx]?.toolName ?? "settlement"}` : "→ settlement"
+      });
     }
 
     // ── Step 3: Agent reflects on tool results (tool chaining) ─────
@@ -524,6 +719,20 @@ export class Orchestrator {
       if (reflection.action === "CALL_MORE_TOOLS" && reflection.additionalTools?.length) {
         console.log(`[Agent] 🔗 Tool chaining: calling ${reflection.additionalTools.length} additional tools`);
         for (const extraTool of reflection.additionalTools) {
+          this.repo.addAp2Receipt({
+            id: `receipt_${command.cmdId}_chain_${extraTool.toolName}_${randomBytes(2).toString("hex")}`,
+            docId: command.docId,
+            cmdId: command.cmdId,
+            kind: "TOOL_CHAIN",
+            payload: {
+              previousTools: toolResults.map((entry) => entry.toolName),
+              nextTool: extraTool.toolName,
+              shouldChain: true,
+              reasoning: reflection.reasoning,
+              budgetRemaining: remainingBudget
+            },
+            createdAt: nowIso()
+          });
           if (!this.config.x402ToolAllowlist.has(extraTool.toolName)) {
             console.log(`[Agent]   ⚠ Skipping ${extraTool.toolName} (not in allowlist)`);
             continue;
@@ -550,6 +759,11 @@ export class Orchestrator {
             this.repo.addSpend(command.docId, command.cmdId, "tool", receipt.costUsdc, "x402", traceId);
             remainingBudget -= receipt.costUsdc;
             console.log(`[x402]   ✓ Chain: ${extraTool.toolName} paid $${receipt.costUsdc}`);
+            await this.docService.appendToolChainRow({
+              tool: extraTool.toolName,
+              result: `HTTP ${receipt.retryStatus ?? response.status}`,
+              nextAction: "→ settlement"
+            });
           } catch (err) {
             console.warn(`[Agent]   ⚠ Chained tool ${extraTool.toolName} failed: ${(err as Error).message}`);
           }
@@ -566,8 +780,10 @@ export class Orchestrator {
       return null;
     });
     const spendTotal = this.repo.getCommandSpend(command.docId, command.cmdId);
+    const payoutExplorerUrl = buildBaseTxExplorerUrl(this.config.X402_CHAIN, txHash);
     const blockLabel = confirmation?.blockNumber ? ` | block=${confirmation.blockNumber}` : "";
-    console.log(`[Agent] ✅ Settlement complete: tx=${txHash}${blockLabel} | total_spend=${spendTotal.toFixed(2)} USDC`);
+    const confLabel = confirmation ? ` | conf=${confirmation.confirmations}` : "";
+    console.log(`[Agent] ✅ Settlement complete: tx=${txHash}${blockLabel}${confLabel} | total_spend=${spendTotal.toFixed(2)} USDC`);
 
     this.repo.addAp2Receipt({
       id: `receipt_${command.cmdId}_settlement`,
@@ -576,8 +792,10 @@ export class Orchestrator {
       kind: "SETTLEMENT",
       payload: {
         txHash,
+        explorerUrl: payoutExplorerUrl,
         settlementStatus: confirmation?.status ?? "unknown",
         blockNumber: confirmation?.blockNumber?.toString(),
+        confirmations: confirmation?.confirmations ?? 0,
         outcome: "PAYOUT_EXECUTED",
         spendTotalUsdc: spendTotal,
         agentReasoning: agentPlan?.reasoning ?? `Vendor ${parsed.vendor}: ${tools.length} tool checks passed (data cost: $${estimated.toFixed(2)}). Settled ${parsed.amountUsdc} USDC.`
@@ -587,9 +805,34 @@ export class Orchestrator {
 
     this.repo.updateCommandStatus(command.docId, command.cmdId, "DONE");
     const auditBlock = confirmation?.blockNumber ? ` block=${confirmation.blockNumber.toString()}` : "";
+    const auditConf = confirmation ? ` conf=${confirmation.confirmations}` : "";
     await this.docService.appendAuditLine(
-      `ZORO ${command.cmdId} DONE payout_tx=${txHash}${auditBlock} spend=${spendTotal.toFixed(2)}USDC`
+      `ZORO ${command.cmdId} DONE payout_tx=${txHash}${auditBlock}${auditConf} spend=${spendTotal.toFixed(2)}USDC explorer=${payoutExplorerUrl}`
     );
+    await this.docService.appendTransactionHistoryRow({
+      type: "PAYMENT",
+      asset: "USDC",
+      amount: `${parsed.amountUsdc.toFixed(2)}`,
+      status: "DONE",
+      txHash,
+      explorerUrl: payoutExplorerUrl,
+      blockNumber: confirmation?.blockNumber?.toString(),
+      confirmations: confirmation?.confirmations ?? 0
+    });
+
+    // Insert spend breakdown chart into Google Doc
+    try {
+      const spendItems: Array<{ label: string; amountUsdc: number }> = [];
+      for (const tr of toolResults) {
+        spendItems.push({ label: `🔧 ${tr.toolName}`, amountUsdc: tr.costUsdc });
+      }
+      spendItems.push({ label: `💸 Settlement`, amountUsdc: parsed.amountUsdc });
+      const spendChartUrl = buildSpendChartUrl({ cmdId: command.cmdId, items: spendItems });
+      await this.docService.insertImage("Log", spendChartUrl, `💰 ${command.cmdId} — Total: $${spendTotal.toFixed(2)} USDC`);
+      console.log(`[Agent] 📊 Spend chart inserted for ${command.cmdId}`);
+    } catch (chartErr) {
+      console.log(`[Agent] ⚠️ Spend chart insertion failed (non-critical): ${(chartErr as Error).message}`);
+    }
   }
 
   private async executeTreasurySwap(command: CommandRecord): Promise<void> {
@@ -708,6 +951,23 @@ export class Orchestrator {
         const reasoning = `${toToken} at $${priceResearch.price ?? "?"} (${priceResearch.change24h ?? "?"}%) — ${priceResearch.recommendation ?? "PROCEEDING"}`;
         console.log(`[DeFi] 📊 Research: ${reasoning}`);
         await this.docService.appendAuditLine(`ZORO ${command.cmdId} RESEARCH price_check: ${reasoning}`);
+
+        // Insert price chart into Google Doc
+        if (priceResearch.price) {
+          try {
+            const chartUrl = buildPriceChartUrl({
+              token: toToken,
+              prices: [priceResearch.price * 0.98, priceResearch.price * 0.99, priceResearch.price * 1.01, priceResearch.price * 0.995, priceResearch.price],
+              labels: ["-4h", "-3h", "-2h", "-1h", "now"],
+              currentPrice: priceResearch.price,
+              change24h: priceResearch.change24h ?? "0"
+            });
+            await this.docService.insertImage("Log", chartUrl, `📊 ${toToken}/USDC — $${priceResearch.price.toFixed(2)} (${priceResearch.change24h ?? "0"}%)`);
+            console.log(`[DeFi] 📊 Chart inserted into doc for ${toToken}`);
+          } catch (chartErr) {
+            console.log(`[DeFi] ⚠️ Chart insertion failed (non-critical): ${(chartErr as Error).message}`);
+          }
+        }
       } catch (err) {
         console.log(`[DeFi] ⚠️ Price research failed (proceeding anyway): ${(err as Error).message}`);
       }
@@ -736,31 +996,112 @@ export class Orchestrator {
         console.log(`[Agent] 🚫 Swap ABORT after price analysis: ${swapReflection.reasoning}`);
         this.repo.updateCommandStatus(command.docId, command.cmdId, "ABORTED", swapReflection.reasoning);
         await this.docService.appendAuditLine(`ZORO ${command.cmdId} ABORTED agent_reflection=${swapReflection.reasoning}`);
+        await this.docService.appendTransactionHistoryRow({
+          type: "SWAP",
+          asset: `USDC→${toToken}`,
+          amount: `${command.parsed.amountUsdc.toFixed(2)}`,
+          status: "ABORTED",
+          txHash: "agent_reflection"
+        });
         return;
       }
       console.log(`[Agent] ✅ Post-analysis: ${swapReflection.action} — ${swapReflection.reasoning}`);
+    }
+
+    let uniswapQuote: Awaited<ReturnType<typeof getUniswapQuote>> | null = null;
+    try {
+      if (!this.config.BASE_RPC_URL) {
+        throw new Error("BASE_RPC_URL is required for Uniswap quote");
+      }
+
+      uniswapQuote = await getUniswapQuote({
+        rpcUrl: this.config.BASE_RPC_URL,
+        quoterAddress: this.config.UNISWAP_QUOTER_V2 as `0x${string}`,
+        factoryAddress: this.config.UNISWAP_V3_FACTORY as `0x${string}`,
+        usdcAddress: this.config.BASE_USDC_ADDRESS as `0x${string}`,
+        wethAddress: this.config.WETH_ADDRESS as `0x${string}`,
+        amountInUsdc: command.parsed.amountUsdc,
+        slippageBps: command.parsed.slippageBps
+      });
+
+      this.repo.addAp2Receipt({
+        id: `receipt_${command.cmdId}_swap_quote`,
+        docId: command.docId,
+        cmdId: command.cmdId,
+        kind: "DEFI",
+        payload: {
+          event: "UNISWAP_QUOTE_READY",
+          quote: {
+            ...uniswapQuote,
+            router: this.config.UNISWAP_SWAP_ROUTER02,
+            poolExplorerUrl: buildBaseAddressExplorerUrl(this.config.X402_CHAIN, uniswapQuote.pool)
+          }
+        },
+        createdAt: nowIso()
+      });
+      await this.docService.appendToolChainRow({
+        tool: "uniswap-quoter-v2",
+        result: `pool=${uniswapQuote.pool} fee=${uniswapQuote.feeTier}`,
+        nextAction: "→ swap"
+      });
+      console.log(`[DeFi] Quote ready: ${uniswapQuote.amountOutWeth} WETH (min ${uniswapQuote.minOutWeth}) fee=${uniswapQuote.feeTier}`);
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      this.repo.updateCommandStatus(command.docId, command.cmdId, "ABORTED", message);
+      this.repo.addAp2Receipt({
+        id: `receipt_${command.cmdId}_swap_quote_abort`,
+        docId: command.docId,
+        cmdId: command.cmdId,
+        kind: "ABORT",
+        payload: {
+          reasonCode: "UNISWAP_QUOTE_FAILED",
+          message
+        },
+        createdAt: nowIso()
+      });
+      await this.docService.appendAuditLine(`ZORO ${command.cmdId} ABORTED reason=UNISWAP_QUOTE_FAILED`);
+      return;
     }
 
     // ── Execute swap ──────────────────────────────────────────────
     const swapReasoning = priceResearch.recommendation === "FAVORABLE_ENTRY"
       ? `${toToken} price favorable (${priceResearch.change24h}). Proceeding with swap.`
       : `${toToken} price neutral/dip (${priceResearch.change24h}). Proceeding per user request.`;
-    const quoteOut = typeof priceResearch.price === "number" && priceResearch.price > 0
-      ? Number((command.parsed.amountUsdc / priceResearch.price).toFixed(6))
-      : undefined;
-    const quoteMinOut = typeof quoteOut === "number"
-      ? Number((quoteOut * (1 - command.parsed.slippageBps / 10_000)).toFixed(6))
-      : undefined;
+    const quoteOut = uniswapQuote
+      ? Number.parseFloat(uniswapQuote.amountOutWeth)
+      : typeof priceResearch.price === "number" && priceResearch.price > 0
+        ? Number((command.parsed.amountUsdc / priceResearch.price).toFixed(6))
+        : undefined;
+    const quoteMinOut = uniswapQuote
+      ? Number.parseFloat(uniswapQuote.minOutWeth)
+      : typeof quoteOut === "number"
+        ? Number((quoteOut * (1 - command.parsed.slippageBps / 10_000)).toFixed(6))
+        : undefined;
     console.log(`[Agent] 🧠 Swap reasoning: ${swapReasoning}`);
     console.log(`[Agent] 💱 Executing swap: ${command.parsed.amountUsdc} USDC → ${toToken} (slippage: ${command.parsed.slippageBps}bps, max: ${command.parsed.maxSpendUsdc} USDC)`);
 
     const swap = await this.defiSwapService.executeTreasurySwap({
       amountUsdc: command.parsed.amountUsdc,
       maxSpendUsdc: command.parsed.maxSpendUsdc,
-      slippageBps: command.parsed.slippageBps
+      slippageBps: command.parsed.slippageBps,
+      uniswapQuote: uniswapQuote
+        ? {
+          pool: uniswapQuote.pool,
+          feeTier: uniswapQuote.feeTier,
+          router: this.config.UNISWAP_SWAP_ROUTER02
+        }
+        : undefined
     });
 
-    console.log(`[Agent] ✅ Swap complete: tx=${swap.txHash} via ${swap.venue}`);
+    const swapConfirmation = await this.cdpWallet.waitForSettlement(swap.txHash).catch((error) => {
+      const message = error instanceof Error ? error.message : String(error);
+      console.warn(`[DeFi] Swap confirmation lookup failed: ${message}`);
+      return null;
+    });
+    const swapExplorerUrl = buildBaseTxExplorerUrl(this.config.X402_CHAIN, swap.txHash);
+    const swapBlockLabel = swapConfirmation?.blockNumber ? ` block=${swapConfirmation.blockNumber}` : "";
+    const swapConfLabel = swapConfirmation ? ` conf=${swapConfirmation.confirmations}` : "";
+    console.log(`[Agent] ✅ Swap complete: tx=${swap.txHash} via ${swap.venue}${swapBlockLabel}${swapConfLabel}`);
 
     this.repo.addDefiTrade(command.docId, command.cmdId, swap.chain, swap.venue, swap.txHash, swap.details);
     this.repo.addAp2Receipt({
@@ -770,6 +1111,7 @@ export class Orchestrator {
       kind: "DEFI",
       payload: {
         txHash: swap.txHash,
+        explorerUrl: swapExplorerUrl,
         chain: swap.chain,
         venue: swap.venue,
         reasonCodes: swap.reasonCodes,
@@ -783,15 +1125,42 @@ export class Orchestrator {
         quote: {
           estimatedOut: quoteOut,
           minOut: quoteMinOut,
-          source: priceResearch.price ? "price-check" : "none"
+          source: uniswapQuote ? "uniswap-quoter-v2" : priceResearch.price ? "price-check" : "none",
+          uniswapQuote: uniswapQuote
+            ? {
+              ...uniswapQuote,
+              router: this.config.UNISWAP_SWAP_ROUTER02,
+              poolExplorerUrl: buildBaseAddressExplorerUrl(this.config.X402_CHAIN, uniswapQuote.pool)
+            }
+            : null
         },
+        confirmation: swapConfirmation
+          ? {
+            blockNumber: swapConfirmation.blockNumber?.toString(),
+            confirmations: swapConfirmation.confirmations,
+            status: swapConfirmation.status
+          }
+          : null,
         details: swap.details
       },
       createdAt: nowIso()
     });
 
     this.repo.updateCommandStatus(command.docId, command.cmdId, "DONE");
-    await this.docService.appendAuditLine(`ZORO ${command.cmdId} DONE defi_tx=${swap.txHash}`);
+    const poolDetails = uniswapQuote ? ` pool=${uniswapQuote.pool} fee=${uniswapQuote.feeTier}` : "";
+    await this.docService.appendAuditLine(
+      `ZORO ${command.cmdId} DONE defi_tx=${swap.txHash}${poolDetails}${swapBlockLabel}${swapConfLabel} explorer=${swapExplorerUrl}`
+    );
+    await this.docService.appendTransactionHistoryRow({
+      type: "SWAP",
+      asset: `USDC→${toToken}`,
+      amount: `${command.parsed.amountUsdc.toFixed(2)}`,
+      status: "DONE",
+      txHash: swap.txHash,
+      explorerUrl: swapExplorerUrl,
+      blockNumber: swapConfirmation?.blockNumber?.toString(),
+      confirmations: swapConfirmation?.confirmations ?? 0
+    });
   }
 
   private async executePrivatePayout(command: CommandRecord): Promise<void> {
@@ -851,12 +1220,72 @@ export class Orchestrator {
         },
         createdAt: nowIso()
       });
+      await this.docService.appendTransactionHistoryRow({
+        type: "ENCRYPTED",
+        asset: "USDC",
+        amount: `${command.parsed.amountUsdc.toFixed(2)}`,
+        status: "LOCKED",
+        txHash: draft.jobId
+      });
     }
 
     this.repo.updateCommandStatus(command.docId, command.cmdId, "EXECUTING");
     await this.docService.appendAuditLine(
       `ZORO ${command.cmdId} ENCRYPTED_PENDING unlockAt=${command.parsed.unlockAt}`
     );
+  }
+
+  private async executeRecurringPay(command: CommandRecord): Promise<void> {
+    if (command.parsed.kind !== "RECURRING_PAY") {
+      throw new Error("Invalid command kind for recurring pay");
+    }
+
+    const parsed = command.parsed;
+
+    // Register the recurring schedule
+    if (this.scheduler) {
+      this.scheduler.addRule({
+        id: `recurring_${command.cmdId}`,
+        vendor: parsed.vendor,
+        amountUsdc: parsed.amountUsdc,
+        to: parsed.to,
+        frequency: parsed.frequency,
+        nextRunAt: this.computeNextRecurring(parsed.frequency),
+        enabled: true
+      });
+    }
+
+    // Create the first payment as a PAY_VENDOR command
+    const firstPayCmd = `Pay ${parsed.vendor} ${parsed.amountUsdc} USDC to ${parsed.to}`;
+    await this.docService.enqueueCommandInput(firstPayCmd);
+
+    this.repo.addAp2Receipt({
+      id: `receipt_${command.cmdId}_recurring_registered`,
+      docId: command.docId,
+      cmdId: command.cmdId,
+      kind: "RECURRING",
+      payload: {
+        event: "RECURRING_REGISTERED",
+        vendor: parsed.vendor,
+        amountUsdc: parsed.amountUsdc,
+        to: parsed.to,
+        frequency: parsed.frequency,
+        firstPaymentInjected: true
+      },
+      createdAt: nowIso()
+    });
+
+    this.repo.updateCommandStatus(command.docId, command.cmdId, "DONE");
+    await this.docService.appendAuditLine(
+      `ZORO ${command.cmdId} DONE recurring=${parsed.frequency} vendor=${parsed.vendor} amount=${parsed.amountUsdc}USDC`
+    );
+    await this.docService.appendTransactionHistoryRow({
+      type: "RECURRING",
+      asset: "USDC",
+      amount: `${parsed.amountUsdc.toFixed(2)}`,
+      status: "DONE",
+      txHash: `recurring_${command.cmdId}`
+    });
   }
 
   buildApprovalSummary(docId: string, cmdId: string): {
@@ -889,6 +1318,14 @@ export class Orchestrator {
     return this.repo.getTrace(docId, cmdId);
   }
 
+  listAgentThoughts(docId: string): ReturnType<Repo["listAgentThoughts"]> {
+    return this.repo.listAgentThoughts(docId, 20);
+  }
+
+  getCurrentGoal(docId: string): ReturnType<Repo["getCurrentGoal"]> {
+    return this.repo.getCurrentGoal(docId);
+  }
+
   listAllCommands(docId: string): CommandRecord[] {
     return this.repo.listCommands(docId);
   }
@@ -911,6 +1348,17 @@ export class Orchestrator {
 
   async tick(docId: string): Promise<void> {
     await this.ingestDocCommands(docId);
+    await this.pollForWalletConnect(docId);
+    await this.pollForApprovals(docId);
+
+    const approved = this.repo.listCommandsByStatus("APPROVED").filter((e) => e.docId === docId);
+    if (approved.length > 0) {
+      console.log(`[Orchestrator] 🔄 Found ${approved.length} APPROVED commands to execute`);
+      for (const cmd of approved) {
+        console.log(`[Orchestrator]   → ${cmd.cmdId} (${cmd.parsed.kind})`);
+      }
+    }
+
     await this.executeApprovedCommands(docId);
     await this.processEncryptedJobs(docId);
 
@@ -920,11 +1368,55 @@ export class Orchestrator {
         const due = await this.scheduler.checkDuePayments(docId);
         for (const cmdText of due) {
           console.log(`[Scheduler] Injecting recurring command: ${cmdText}`);
-          await this.docService.appendInboxLine?.(cmdText);
+          await this.docService.enqueueCommandInput(cmdText);
         }
       } catch (err) {
         console.warn(`[Scheduler] Error: ${(err as Error).message}`);
       }
     }
+  }
+
+  private extractTarget(parsed: ParsedCommand): string {
+    if (parsed.kind === "TREASURY_SWAP") {
+      return parsed.toToken;
+    }
+    if (parsed.kind === "PAY_VENDOR" || parsed.kind === "PRIVATE_PAYOUT") {
+      return parsed.to;
+    }
+    return parsed.to;
+  }
+
+  private extractVolume(parsed: ParsedCommand): string {
+    if (parsed.kind === "RECURRING_PAY") {
+      return `${parsed.amountUsdc} USDC`;
+    }
+    return `${parsed.amountUsdc} USDC`;
+  }
+
+  private formatCommandStatus(status: string, cmdId: string): string {
+    const badge = status.includes("DONE") || status.includes("APPROVED")
+      ? "✅"
+      : status.includes("FAILED") || status.includes("ABORTED")
+        ? "❌"
+        : status.includes("EXECUTING")
+          ? "🔄"
+          : "⏳";
+    return `${badge} ${status} ${cmdId}`;
+  }
+
+  private computeNextRecurring(frequency: "daily" | "weekly" | "monthly"): string {
+    const next = new Date();
+    switch (frequency) {
+      case "daily":
+        next.setUTCDate(next.getUTCDate() + 1);
+        break;
+      case "weekly":
+        next.setUTCDate(next.getUTCDate() + 7);
+        break;
+      case "monthly":
+        next.setUTCMonth(next.getUTCMonth() + 1);
+        break;
+    }
+    return next.toISOString();
   }
 }

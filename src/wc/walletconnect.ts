@@ -1,5 +1,3 @@
-import { randomBytes, randomUUID } from "crypto";
-import { privateKeyToAccount } from "viem/accounts";
 import type { AppConfig } from "../config.js";
 
 export type SessionRecord = {
@@ -7,7 +5,6 @@ export type SessionRecord = {
   uri: string;
   address: string;
   docId: string;
-  privateKey?: `0x${string}`;
   createdAt: string;
   pending: boolean;
 };
@@ -35,27 +32,64 @@ export class WalletConnectService {
       return existing;
     }
 
-    if (this.config.STRICT_LIVE_MODE !== 1) {
-      const privateKey = (`0x${randomBytes(32).toString("hex")}`) as `0x${string}`;
-      const account = privateKeyToAccount(privateKey);
-      const topic = randomUUID();
-      const session: SessionRecord = {
-        topic,
-        uri: `wc:${topic}@2?relay-protocol=irn&symKey=${randomUUID().replace(/-/g, "")}`,
-        address: account.address,
-        privateKey,
-        docId,
-        createdAt: new Date().toISOString(),
-        pending: false
-      };
-      this.sessionsByDoc.set(docId, session);
-      return session;
+    const uri = await this.generateConnectionUri(docId);
+    return this.sessionsByDoc.get(docId) ?? {
+      topic: "",
+      uri,
+      address: "",
+      docId,
+      createdAt: new Date().toISOString(),
+      pending: true
+    };
+  }
+
+  getSession(docId: string): SessionRecord | null {
+    return this.sessionsByDoc.get(docId) ?? null;
+  }
+
+  async syncSession(docId: string): Promise<SessionRecord | null> {
+    const current = this.sessionsByDoc.get(docId);
+    if (!current || !current.pending) {
+      return current ?? null;
+    }
+
+    const client = await this.getSignClient();
+    const sessions = (client.session?.getAll?.() as WalletConnectSession[] | undefined) ?? [];
+    const approved = sessions.find((entry) => {
+      try {
+        return Boolean(extractAddressFromSession(entry));
+      } catch {
+        return false;
+      }
+    });
+
+    if (!approved) {
+      return current;
+    }
+
+    const connected: SessionRecord = {
+      topic: approved.topic,
+      uri: current.uri,
+      address: extractAddressFromSession(approved),
+      docId,
+      createdAt: new Date().toISOString(),
+      pending: false
+    };
+    this.sessionsByDoc.set(docId, connected);
+    this.pendingApprovals.delete(docId);
+    return connected;
+  }
+
+  async generateConnectionUri(docId: string): Promise<string> {
+    const existing = this.sessionsByDoc.get(docId);
+    if (existing?.uri) {
+      return existing.uri;
     }
 
     const client = await this.getSignClient();
     const requiredNamespaces = {
       eip155: {
-        methods: ["eth_signTypedData_v4"],
+        methods: ["eth_signTypedData_v4", "eth_sendTransaction"],
         chains: [`eip155:${this.config.AP2_CHAIN_ID}`],
         events: ["accountsChanged", "chainChanged"]
       }
@@ -63,8 +97,123 @@ export class WalletConnectService {
 
     const connectResult = await client.connect({ requiredNamespaces });
     const uri = connectResult.uri ?? "";
-    const approvalPromise = connectResult.approval as Promise<WalletConnectSession>;
 
+    // connectResult.approval may be a Promise, a callable returning a Promise, or undefined
+    let approvalPromise: Promise<WalletConnectSession> | undefined;
+    if (connectResult.approval) {
+      if (typeof connectResult.approval === "function") {
+        approvalPromise = (connectResult.approval as () => Promise<WalletConnectSession>)();
+      } else if (typeof (connectResult.approval as Promise<WalletConnectSession>).then === "function") {
+        approvalPromise = connectResult.approval as Promise<WalletConnectSession>;
+      }
+    }
+
+    if (approvalPromise) {
+      this.trackPendingApproval(docId, uri, approvalPromise);
+    } else {
+      // No approval promise — store as pending session without tracking
+      const pendingSession: SessionRecord = {
+        topic: "",
+        uri,
+        address: "",
+        docId,
+        createdAt: new Date().toISOString(),
+        pending: true
+      };
+      this.sessionsByDoc.set(docId, pendingSession);
+    }
+    return uri;
+  }
+
+  async connectFromUri(docId: string, uri: string): Promise<SessionRecord> {
+    const normalized = uri.trim();
+    if (!normalized.startsWith("wc:")) {
+      throw new Error("Invalid WalletConnect URI");
+    }
+
+    const client = await this.getSignClient();
+    await client.pair({ uri: normalized });
+    const pendingSession: SessionRecord = {
+      topic: "",
+      uri: normalized,
+      address: "",
+      docId,
+      createdAt: new Date().toISOString(),
+      pending: true
+    };
+    this.sessionsByDoc.set(docId, pendingSession);
+    return pendingSession;
+  }
+
+  async requestTypedDataSignature(
+    docId: string,
+    typedData: {
+      domain: Record<string, unknown>;
+      types: Record<string, Array<{ name: string; type: string }>>;
+      primaryType: string;
+      message: Record<string, unknown>;
+    }
+  ): Promise<SignatureResult> {
+    const session = await this.ensureSession(docId);
+
+    let liveSession = session;
+    if (liveSession.pending || !liveSession.topic || !liveSession.address) {
+      const synced = await this.syncSession(docId);
+      if (synced && !synced.pending && synced.topic && synced.address) {
+        liveSession = synced;
+      } else {
+        const pending = this.pendingApprovals.get(docId);
+        if (pending) {
+          throw new Error("WalletConnect session is pending approval. Approve the connection in the Connect tab.");
+        }
+        throw new Error("No WalletConnect session found. Connect your wallet from the doc Connect tab.");
+      }
+    }
+
+    const client = await this.getSignClient();
+    const signature = (await client.request({
+      topic: liveSession.topic,
+      chainId: `eip155:${this.config.AP2_CHAIN_ID}`,
+      request: {
+        method: "eth_signTypedData_v4",
+        params: [liveSession.address, JSON.stringify(typedData)]
+      }
+    })) as string;
+
+    return {
+      signerAddress: liveSession.address,
+      signature
+    };
+  }
+
+  private async getSignClient(): Promise<any> {
+    if (this.signClientPromise) {
+      return this.signClientPromise;
+    }
+
+    if (!this.config.WC_PROJECT_ID) {
+      throw new Error("WC_PROJECT_ID is required for WalletConnect");
+    }
+
+    this.signClientPromise = (async () => {
+      const mod = await import("@walletconnect/sign-client");
+      const SignClient = (mod as { default: { init: (opts: Record<string, unknown>) => Promise<any> } }).default;
+      return SignClient.init({
+        projectId: this.config.WC_PROJECT_ID,
+        relayUrl: this.config.WC_RELAY_URL,
+        metadata: {
+          name: this.config.WC_APP_NAME,
+          description: "Zoro AP2 Authorization",
+          url: "https://zoro.local",
+          icons: ["https://zoro.local/icon.png"]
+        }
+      });
+    })();
+
+    return this.signClientPromise;
+  }
+
+  private trackPendingApproval(docId: string, uri: string, approvalPromise: Promise<WalletConnectSession>): void {
     const pendingSession: SessionRecord = {
       topic: "",
       uri,
@@ -95,109 +244,6 @@ export class WalletConnectService {
         this.sessionsByDoc.delete(docId);
         this.pendingApprovals.delete(docId);
       });
-
-    return pendingSession;
-  }
-
-  getSession(docId: string): SessionRecord | null {
-    return this.sessionsByDoc.get(docId) ?? null;
-  }
-
-  async requestTypedDataSignature(
-    docId: string,
-    typedData: {
-      domain: Record<string, unknown>;
-      types: Record<string, Array<{ name: string; type: string }>>;
-      primaryType: string;
-      message: Record<string, unknown>;
-    }
-  ): Promise<SignatureResult> {
-    const session = await this.ensureSession(docId);
-
-    if (this.config.STRICT_LIVE_MODE !== 1) {
-      if (!session.privateKey) {
-        throw new Error("Local signer session missing private key");
-      }
-      const account = privateKeyToAccount(session.privateKey);
-      const signature = await account.signTypedData({
-        domain: typedData.domain as {
-          name?: string;
-          version?: string;
-          chainId?: number;
-          verifyingContract?: `0x${string}`;
-        },
-        types: typedData.types,
-        primaryType: typedData.primaryType,
-        message: typedData.message
-      });
-
-      return {
-        signerAddress: session.address,
-        signature
-      };
-    }
-
-    let liveSession = session;
-    if (liveSession.pending || !liveSession.topic || !liveSession.address) {
-      const pending = this.pendingApprovals.get(docId);
-      if (!pending) {
-        throw new Error("No pending WalletConnect approval found. Re-open /sessions/:docId and reconnect.");
-      }
-      const approved = await pending;
-      const address = extractAddressFromSession(approved);
-      liveSession = {
-        topic: approved.topic,
-        uri: session.uri,
-        address,
-        docId,
-        createdAt: new Date().toISOString(),
-        pending: false
-      };
-      this.sessionsByDoc.set(docId, liveSession);
-      this.pendingApprovals.delete(docId);
-    }
-
-    const client = await this.getSignClient();
-    const signature = (await client.request({
-      topic: liveSession.topic,
-      chainId: `eip155:${this.config.AP2_CHAIN_ID}`,
-      request: {
-        method: "eth_signTypedData_v4",
-        params: [liveSession.address, JSON.stringify(typedData)]
-      }
-    })) as string;
-
-    return {
-      signerAddress: liveSession.address,
-      signature
-    };
-  }
-
-  private async getSignClient(): Promise<any> {
-    if (this.signClientPromise) {
-      return this.signClientPromise;
-    }
-
-    if (!this.config.WC_PROJECT_ID) {
-      throw new Error("WC_PROJECT_ID is required for strict live WalletConnect mode");
-    }
-
-    this.signClientPromise = (async () => {
-      const mod = await import("@walletconnect/sign-client");
-      const SignClient = (mod as { default: { init: (opts: Record<string, unknown>) => Promise<any> } }).default;
-      return SignClient.init({
-        projectId: this.config.WC_PROJECT_ID,
-        relayUrl: this.config.WC_RELAY_URL,
-        metadata: {
-          name: this.config.WC_APP_NAME,
-          description: "Zoro AP2 Authorization",
-          url: "https://zoro.local",
-          icons: ["https://zoro.local/icon.png"]
-        }
-      });
-    })();
-
-    return this.signClientPromise;
   }
 }
 

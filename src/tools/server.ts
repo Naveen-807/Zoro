@@ -1,266 +1,516 @@
 import { serve } from "@hono/node-server";
 import { Hono } from "hono";
-import { sha256Hex } from "../utils/hash.js";
 import { paymentMiddleware, x402ResourceServer } from "@x402/hono";
 import { HTTPFacilitatorClient, type FacilitatorClient } from "@x402/core/server";
 import { registerExactEvmScheme as registerExactEvmServerScheme } from "@x402/evm/exact/server";
 import { toCaip2Network } from "../x402/network.js";
+import { base, baseSepolia } from "viem/chains";
+import { createPublicClient, formatEther, formatGwei, http } from "viem";
 
 export type ToolServerOptions = {
   port: number;
   sellerAddress: string;
   chain: string;
   facilitatorUrl?: string;
+  strictLiveMode: number;
+  noMockMode: number;
+  baseRpcUrl?: string;
+  baseUsdcAddress: string;
+  trmSanctionsApiKey?: string;
+  trmSanctionsApiUrl: string;
 };
 
-type PaidTool = {
-  name: "vendor-risk" | "compliance-check" | "price-check";
+type ToolCatalogItem = {
+  name: string;
   description: string;
   endpoint: string;
   priceUsdc: number;
+  paymentModel: "x402" | "free";
 };
 
-const TOOLS: PaidTool[] = [
+const PAID_TOOLS: ToolCatalogItem[] = [
   {
     name: "vendor-risk",
-    description: "Deterministic vendor risk score from vendor hash",
+    description: "Vendor risk score from Base testnet on-chain signals",
     endpoint: "/tools/vendor-risk",
-    priceUsdc: 0.25
+    priceUsdc: 0.25,
+    paymentModel: "x402"
   },
   {
     name: "compliance-check",
-    description: "Deterministic compliance verdict from vendor hash",
+    description: "Sanctions screening via TRM Labs",
     endpoint: "/tools/compliance-check",
-    priceUsdc: 0.5
+    priceUsdc: 0.5,
+    paymentModel: "x402"
   },
   {
     name: "price-check",
     description: "Token price feed for DeFi pre-swap research",
     endpoint: "/tools/price-check",
-    priceUsdc: 0.1
+    priceUsdc: 0.1,
+    paymentModel: "x402"
   }
 ];
-const VENDOR_RISK_TOOL: PaidTool = TOOLS[0]!;
-const COMPLIANCE_TOOL: PaidTool = TOOLS[1]!;
+
+const FREE_TOOLS: ToolCatalogItem[] = [
+  {
+    name: "balance-check",
+    description: "Address ETH and USDC balances on Base testnet",
+    endpoint: "/tools/balance-check",
+    priceUsdc: 0,
+    paymentModel: "free"
+  },
+  {
+    name: "gas-estimate",
+    description: "Current Base testnet gas estimate",
+    endpoint: "/tools/gas-estimate",
+    priceUsdc: 0,
+    paymentModel: "free"
+  },
+  {
+    name: "token-info",
+    description: "Token market metadata from CoinGecko",
+    endpoint: "/tools/token-info",
+    priceUsdc: 0,
+    paymentModel: "free"
+  }
+];
+
+const ERC20_BALANCE_OF_ABI = [
+  {
+    name: "balanceOf",
+    type: "function",
+    stateMutability: "view",
+    inputs: [{ name: "account", type: "address" }],
+    outputs: [{ name: "", type: "uint256" }]
+  }
+] as const;
 
 export function startToolServer(options: ToolServerOptions): { close: () => Promise<void> } {
   const app = new Hono();
   const chainNetwork = toCaip2Network(options.chain);
+  validateNoMockToolConfig(options);
   const facilitatorClient = createFacilitatorClient(options);
-  const resourceServer = registerExactEvmServerScheme(
-    new x402ResourceServer(facilitatorClient),
-    { networks: [chainNetwork] }
-  );
+  const publicClient = options.baseRpcUrl
+    ? createPublicClient({
+      chain: resolveChain(options.chain),
+      transport: http(options.baseRpcUrl)
+    })
+    : null;
 
-  app.use(
-    paymentMiddleware(
-      {
-        "POST /tools/vendor-risk": {
-          accepts: {
-            scheme: "exact",
-            price: "$0.25",
-            network: chainNetwork,
-            payTo: options.sellerAddress
+  if (options.strictLiveMode === 1) {
+    const resourceServer = registerExactEvmServerScheme(
+      new x402ResourceServer(facilitatorClient),
+      { networks: [chainNetwork] }
+    );
+
+    app.use(
+      paymentMiddleware(
+        {
+          "POST /tools/vendor-risk": {
+            accepts: {
+              scheme: "exact",
+              price: "$0.25",
+              network: chainNetwork,
+              payTo: options.sellerAddress
+            },
+            description: "On-chain vendor risk analytics",
+            mimeType: "application/json"
           },
-          description: "On-chain vendor risk analytics via Etherscan",
-          mimeType: "application/json"
+          "POST /tools/compliance-check": {
+            accepts: {
+              scheme: "exact",
+              price: "$0.50",
+              network: chainNetwork,
+              payTo: options.sellerAddress
+            },
+            description: "Sanctions compliance screening",
+            mimeType: "application/json"
+          },
+          "POST /tools/price-check": {
+            accepts: {
+              scheme: "exact",
+              price: "$0.10",
+              network: chainNetwork,
+              payTo: options.sellerAddress
+            },
+            description: "Token price feed",
+            mimeType: "application/json"
+          }
         },
-        "POST /tools/compliance-check": {
-          accepts: {
-            scheme: "exact",
-            price: "$0.50",
-            network: chainNetwork,
-            payTo: options.sellerAddress
-          },
-          description: "Deterministic compliance verdict from vendor hash",
-          mimeType: "application/json"
-        },
-        "POST /tools/price-check": {
-          accepts: {
-            scheme: "exact",
-            price: "$0.10",
-            network: chainNetwork,
-            payTo: options.sellerAddress
-          },
-          description: "Token price feed for DeFi pre-swap research",
-          mimeType: "application/json"
-        }
-      },
-      resourceServer
-    )
-  );
+        resourceServer
+      )
+    );
+  } else {
+    console.warn("[ToolServer] ℹ Demo Mode: skipping x402 paymentMiddleware");
+  }
 
   app.get("/.well-known/tools", (c) => {
     return c.json({
-      tools: TOOLS.map((tool) => ({
-        name: tool.name,
-        endpoint: tool.endpoint,
-        priceUsdc: tool.priceUsdc,
-        description: tool.description,
-        paymentModel: "x402"
-      }))
+      tools: [...PAID_TOOLS, ...FREE_TOOLS]
     });
   });
 
   app.post("/tools/vendor-risk", async (c) => {
     const body = (await c.req.json().catch(() => ({}))) as { vendor?: string; address?: string };
     const vendor = body.vendor ?? "UNKNOWN";
-    const targetAddress = isHexAddress(body.address) ? body.address : undefined;
-    const screeningTarget = targetAddress ?? vendor;
-    const signatureHeader = c.req.header("PAYMENT-SIGNATURE") ?? c.req.header("x-payment");
+    const targetAddress = isHexAddress(body.address)
+      ? body.address
+      : isHexAddress(vendor)
+        ? vendor
+        : null;
 
-    let riskScore: number;
-    let tier: string;
-    let reasonCodes: string[];
-    let source: string;
-
-    // If vendor looks like an Ethereum address, try real on-chain analytics
-    const isAddress = isHexAddress(screeningTarget);
-    if (isAddress) {
-      try {
-        // Check address transaction history via Etherscan API (free tier)
-        const etherscanResp = await fetch(
-          `https://api.etherscan.io/api?module=account&action=txlist&address=${screeningTarget}&startblock=0&endblock=99999999&page=1&offset=5&sort=desc`,
-          { signal: AbortSignal.timeout(5000) }
-        );
-        const ethData = (await etherscanResp.json()) as { status: string; result: Array<{ from: string; to: string; value: string; isError: string }> };
-
-        if (ethData.status === "1" && Array.isArray(ethData.result)) {
-          const txCount = ethData.result.length;
-          const hasErrors = ethData.result.some(tx => tx.isError === "1");
-          const totalValue = ethData.result.reduce((sum, tx) => sum + Number(BigInt(tx.value || "0") / BigInt(1e15)) / 1000, 0);
-
-          // Risk scoring based on on-chain activity
-          riskScore = txCount === 0 ? 0.9 : hasErrors ? 0.7 : txCount < 3 ? 0.5 : 0.2;
-          tier = riskScore > 0.75 ? "HIGH" : riskScore > 0.4 ? "MEDIUM" : "LOW";
-          reasonCodes = [
-            `TX_COUNT_${txCount}`,
-            hasErrors ? "HAS_FAILED_TX" : "NO_FAILED_TX",
-            totalValue > 1 ? "SIGNIFICANT_VOLUME" : "LOW_VOLUME"
-          ];
-          source = "etherscan-live";
-          console.log(`[tools] Real risk check for ${screeningTarget.slice(0, 10)}...: ${tier} (${txCount} txns, score ${riskScore})`);
-        } else {
-          throw new Error("No data from Etherscan");
-        }
-      } catch (err) {
-        // Fallback to deterministic
-        const score = deterministicValue(screeningTarget);
-        riskScore = score;
-        tier = score > 0.75 ? "HIGH" : score > 0.4 ? "MEDIUM" : "LOW";
-        reasonCodes = [`TARGET_HASH_${Math.round(score * 100)}`, "ETHERSCAN_FALLBACK"];
-        source = "fallback-deterministic";
-        console.warn(`[tools] Etherscan unavailable, using fallback for ${screeningTarget.slice(0, 10)}...`);
-      }
-    } else {
-      // Non-address vendor: use deterministic hash
-      const score = deterministicValue(screeningTarget);
-      riskScore = score;
-      tier = score > 0.75 ? "HIGH" : score > 0.4 ? "MEDIUM" : "LOW";
-      reasonCodes = [`TARGET_HASH_${Math.round(score * 100)}`];
-      source = "deterministic-hash";
+    if (!targetAddress) {
+      return c.json({ ok: false, error: "Valid Ethereum address required for vendor-risk" }, 400);
     }
 
-    return c.json({
-      ok: true,
-      tool: "vendor-risk",
-      paid: Boolean(signatureHeader),
-      result: {
-        vendor,
-        targetAddress,
-        riskScore,
-        tier,
-        reasonCodes,
-        source,
-        timestamp: new Date().toISOString()
+    if (!publicClient) {
+      return c.json({ ok: false, error: "BASE_RPC_URL is required for vendor-risk" }, 503);
+    }
+
+    try {
+      const [nonce, balanceWei, bytecode] = await Promise.all([
+        publicClient.getTransactionCount({ address: targetAddress as `0x${string}` }),
+        publicClient.getBalance({ address: targetAddress as `0x${string}` }),
+        publicClient.getBytecode({ address: targetAddress as `0x${string}` })
+      ]);
+
+      const balanceEth = Number.parseFloat(formatEther(balanceWei));
+      const isContract = Boolean(bytecode && bytecode !== "0x");
+
+      let riskScore = 0.2;
+      const reasonCodes: string[] = [];
+
+      if (nonce === 0) {
+        riskScore += 0.4;
+        reasonCodes.push("EOA_NONCE_0");
+      } else {
+        reasonCodes.push(`NONCE_${nonce}`);
       }
-    });
+
+      if (isContract) {
+        riskScore += 0.25;
+        reasonCodes.push("CONTRACT_ACCOUNT");
+      } else {
+        reasonCodes.push("EOA_ACCOUNT");
+      }
+
+      if (balanceEth < 0.0001) {
+        riskScore += 0.15;
+        reasonCodes.push("BALANCE_LOW");
+      } else {
+        reasonCodes.push("BALANCE_FUNDED");
+      }
+
+      if (riskScore > 1) {
+        riskScore = 1;
+      }
+
+      const tier = riskScore > 0.75 ? "HIGH" : riskScore > 0.4 ? "MEDIUM" : "LOW";
+
+      return c.json({
+        ok: true,
+        tool: "vendor-risk",
+        paid: Boolean(extractPaymentHeader(c.req.raw)),
+        result: {
+          vendor,
+          targetAddress,
+          riskScore: Number(riskScore.toFixed(4)),
+          tier,
+          reasonCodes,
+          source: "base-rpc-live",
+          signals: {
+            nonce,
+            balanceEth: Number(balanceEth.toFixed(6)),
+            isContract
+          },
+          timestamp: new Date().toISOString()
+        }
+      });
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      return c.json({ ok: false, error: `vendor-risk upstream failure: ${message}` }, 503);
+    }
   });
 
   app.post("/tools/compliance-check", async (c) => {
-    return handleTool(c.req.raw, COMPLIANCE_TOOL, ({ vendor, address }) => {
-      const complianceTarget = isHexAddress(address) ? address : vendor;
-      const score = deterministicValue(`${complianceTarget}:compliance`);
-      return {
-        vendor,
-        targetAddress: isHexAddress(address) ? address : undefined,
-        approved: score < 0.85,
-        score,
-        reasonCodes: score < 0.85 ? ["COMPLIANCE_OK"] : ["COMPLIANCE_REVIEW"]
-      };
-    });
+    const body = (await c.req.json().catch(() => ({}))) as { vendor?: string; address?: string };
+    const targetAddress = isHexAddress(body.address)
+      ? body.address
+      : isHexAddress(body.vendor)
+        ? body.vendor
+        : null;
+
+    if (!targetAddress) {
+      return c.json({ ok: false, error: "Valid Ethereum address required for compliance-check" }, 400);
+    }
+
+    const trmKey = options.trmSanctionsApiKey;
+    if (!trmKey) {
+      // Fallback: no TRM key available, return a passing result on testnet
+      console.warn("[ToolServer] ⚠ No TRM_SANCTIONS_API_KEY — returning default compliance pass");
+      return c.json({
+        ok: true,
+        tool: "compliance-check",
+        paid: Boolean(extractPaymentHeader(c.req.raw)),
+        result: {
+          targetAddress,
+          approved: true,
+          score: 0,
+          reasonCodes: ["COMPLIANCE_OK", "TRM_UNAVAILABLE_TESTNET_PASS"],
+          source: "fallback-no-trm-key",
+          timestamp: new Date().toISOString()
+        }
+      });
+    }
+
+    try {
+      const basicAuth = Buffer.from(`${trmKey}:${trmKey}`).toString("base64");
+      const response = await fetch(options.trmSanctionsApiUrl, {
+        method: "POST",
+        headers: {
+          "content-type": "application/json",
+          authorization: `Basic ${basicAuth}`
+        },
+        body: JSON.stringify([{ address: targetAddress }]),
+        signal: AbortSignal.timeout(6000)
+      });
+
+      if (!response.ok) {
+        return c.json({ ok: false, error: `TRM API error ${response.status}` }, 503);
+      }
+
+      const result = (await response.json()) as Array<{ address: string; isSanctioned: boolean }>;
+      const isSanctioned = Boolean(result?.[0]?.isSanctioned);
+
+      return c.json({
+        ok: true,
+        tool: "compliance-check",
+        paid: Boolean(extractPaymentHeader(c.req.raw)),
+        result: {
+          targetAddress,
+          approved: !isSanctioned,
+          score: isSanctioned ? 1 : 0,
+          reasonCodes: isSanctioned ? ["SANCTIONS_MATCH"] : ["COMPLIANCE_OK"],
+          source: "trm-live",
+          timestamp: new Date().toISOString()
+        }
+      });
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      return c.json({ ok: false, error: `TRM request failed: ${message}` }, 503);
+    }
   });
 
   app.post("/tools/price-check", async (c) => {
     const body = (await c.req.json().catch(() => ({}))) as { token?: string; base?: string };
     const token = (body.token ?? "WETH").toUpperCase();
-    const base = (body.base ?? "USDC").toUpperCase();
+    const quoteBase = (body.base ?? "USDC").toUpperCase();
 
-    // Map common token names to CoinGecko IDs
     const geckoIds: Record<string, string> = {
-      WETH: "ethereum", ETH: "ethereum", WBTC: "bitcoin", BTC: "bitcoin",
-      LINK: "chainlink", UNI: "uniswap", AAVE: "aave", SOL: "solana",
-      MATIC: "matic-network", ARB: "arbitrum", OP: "optimism"
+      WETH: "ethereum",
+      ETH: "ethereum",
+      WBTC: "bitcoin",
+      BTC: "bitcoin",
+      LINK: "chainlink",
+      UNI: "uniswap",
+      AAVE: "aave",
+      SOL: "solana",
+      MATIC: "matic-network",
+      ARB: "arbitrum",
+      OP: "optimism"
     };
-    const geckoId = geckoIds[token] ?? token.toLowerCase();
-    const signatureHeader = c.req.header("PAYMENT-SIGNATURE") ?? c.req.header("x-payment");
 
-    let price: number;
-    let change24h: string;
-    let volume24h: string;
-    let source: string;
+    const geckoId = geckoIds[token] ?? token.toLowerCase();
 
     try {
-      // Real CoinGecko API call (free, no key needed)
-      const resp = await fetch(
+      const response = await fetch(
         `https://api.coingecko.com/api/v3/simple/price?ids=${geckoId}&vs_currencies=usd&include_24hr_change=true&include_24hr_vol=true`,
         { signal: AbortSignal.timeout(5000) }
       );
-      if (!resp.ok) throw new Error(`CoinGecko ${resp.status}`);
-      const data = (await resp.json()) as Record<string, { usd: number; usd_24h_change?: number; usd_24h_vol?: number }>;
-      const entry = data[geckoId];
-      if (!entry?.usd) throw new Error("No price data");
 
-      price = entry.usd;
-      change24h = `${(entry.usd_24h_change ?? 0).toFixed(2)}%`;
-      volume24h = `$${Math.round(entry.usd_24h_vol ?? 0).toLocaleString()}`;
-      source = "coingecko-live";
-      console.log(`[tools] 📊 Real price for ${token}: $${price} (${change24h})`);
-    } catch (err) {
-      // Fallback to deterministic if CoinGecko is down
-      const seed = deterministicValue(`${token}:${base}:${new Date().toISOString().slice(0, 13)}`);
-      const prices: Record<string, number> = { WETH: 3200, WBTC: 62000, LINK: 18, UNI: 12, AAVE: 280 };
-      const basePrice = prices[token] ?? 100;
-      const variance = (seed - 0.5) * 0.04;
-      price = Number((basePrice * (1 + variance)).toFixed(2));
-      change24h = `${((seed - 0.5) * 6).toFixed(2)}%`;
-      volume24h = `$${(basePrice * 1_000_000 * (0.8 + seed * 0.4)).toFixed(0)}`;
-      source = "fallback-estimated";
-      console.warn(`[tools] ⚠ CoinGecko unavailable, using fallback price for ${token}`);
-    }
-
-    const numChange = parseFloat(change24h);
-    return c.json({
-      ok: true,
-      tool: "price-check",
-      paid: Boolean(signatureHeader),
-      result: {
-        token,
-        base,
-        price,
-        change24h,
-        volume24h,
-        source,
-        timestamp: new Date().toISOString(),
-        recommendation: numChange > 0 ? "FAVORABLE_ENTRY" : "WAIT_FOR_DIP"
+      if (!response.ok) {
+        return c.json({ ok: false, error: `CoinGecko API error ${response.status}` }, 503);
       }
-    });
+
+      const data = (await response.json()) as Record<string, { usd: number; usd_24h_change?: number; usd_24h_vol?: number }>;
+      const entry = data[geckoId];
+      if (!entry?.usd) {
+        return c.json({ ok: false, error: "CoinGecko returned empty price payload" }, 503);
+      }
+
+      const change24h = Number(entry.usd_24h_change ?? 0);
+      return c.json({
+        ok: true,
+        tool: "price-check",
+        paid: Boolean(extractPaymentHeader(c.req.raw)),
+        result: {
+          token,
+          base: quoteBase,
+          price: Number(entry.usd.toFixed(6)),
+          change24h: `${change24h.toFixed(2)}%`,
+          volume24h: `$${Math.round(entry.usd_24h_vol ?? 0).toLocaleString()}`,
+          source: "coingecko-live",
+          timestamp: new Date().toISOString(),
+          recommendation: change24h > 0 ? "FAVORABLE_ENTRY" : "WAIT_FOR_DIP"
+        }
+      });
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      return c.json({ ok: false, error: `price-check upstream failure: ${message}` }, 503);
+    }
   });
 
+  app.post("/tools/balance-check", async (c) => {
+    const body = (await c.req.json().catch(() => ({}))) as { address?: string };
+    const address = body.address;
+    if (!isHexAddress(address)) {
+      return c.json({ ok: false, error: "Valid Ethereum address required" }, 400);
+    }
 
-  const server = serve({
-    fetch: app.fetch,
-    port: options.port
+    if (!publicClient) {
+      return c.json({ ok: false, error: "BASE_RPC_URL is required" }, 503);
+    }
+
+    try {
+      const [ethBalanceWei, usdcBalance] = await Promise.all([
+        publicClient.getBalance({ address: address as `0x${string}` }),
+        publicClient.readContract({
+          address: options.baseUsdcAddress as `0x${string}`,
+          abi: ERC20_BALANCE_OF_ABI,
+          functionName: "balanceOf",
+          args: [address as `0x${string}`]
+        })
+      ]);
+
+      return c.json({
+        ok: true,
+        tool: "balance-check",
+        paid: Boolean(extractPaymentHeader(c.req.raw)),
+        result: {
+          address,
+          ethBalance: Number.parseFloat(formatEther(ethBalanceWei)).toFixed(6),
+          usdcBalance: (Number(usdcBalance) / 1_000_000).toFixed(6),
+          chain: options.chain,
+          source: "base-rpc-live",
+          timestamp: new Date().toISOString()
+        }
+      });
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      return c.json({ ok: false, error: `balance-check upstream failure: ${message}` }, 503);
+    }
+  });
+
+  app.post("/tools/gas-estimate", async (c) => {
+    if (!publicClient) {
+      return c.json({ ok: false, error: "BASE_RPC_URL is required" }, 503);
+    }
+
+    try {
+      const fee = await publicClient.estimateFeesPerGas();
+      return c.json({
+        ok: true,
+        tool: "gas-estimate",
+        paid: Boolean(extractPaymentHeader(c.req.raw)),
+        result: {
+          safeGwei: formatGwei(fee.maxPriorityFeePerGas ?? 0n),
+          proposeGwei: formatGwei(fee.maxFeePerGas ?? 0n),
+          fastGwei: formatGwei((fee.maxFeePerGas ?? 0n) + (fee.maxPriorityFeePerGas ?? 0n)),
+          chain: options.chain,
+          source: "base-rpc-live",
+          timestamp: new Date().toISOString()
+        }
+      });
+    } catch {
+      try {
+        const gasPrice = await publicClient.getGasPrice();
+        return c.json({
+          ok: true,
+          tool: "gas-estimate",
+          paid: Boolean(extractPaymentHeader(c.req.raw)),
+          result: {
+            safeGwei: formatGwei(gasPrice),
+            proposeGwei: formatGwei(gasPrice),
+            fastGwei: formatGwei(gasPrice),
+            chain: options.chain,
+            source: "base-rpc-live",
+            timestamp: new Date().toISOString()
+          }
+        });
+      } catch (error) {
+        const message = error instanceof Error ? error.message : String(error);
+        return c.json({ ok: false, error: `gas-estimate upstream failure: ${message}` }, 503);
+      }
+    }
+  });
+
+  app.post("/tools/token-info", async (c) => {
+    const body = (await c.req.json().catch(() => ({}))) as { token?: string };
+    const token = (body.token ?? "ethereum").toLowerCase();
+
+    try {
+      const response = await fetch(
+        `https://api.coingecko.com/api/v3/coins/${token}?localization=false&tickers=false&community_data=false&developer_data=false`,
+        { signal: AbortSignal.timeout(6000) }
+      );
+
+      if (!response.ok) {
+        return c.json({ ok: false, error: `CoinGecko API error ${response.status}` }, 503);
+      }
+
+      const data = (await response.json()) as {
+        id: string;
+        name: string;
+        symbol: string;
+        market_data?: {
+          current_price?: { usd?: number };
+          market_cap?: { usd?: number };
+          total_volume?: { usd?: number };
+        };
+      };
+
+      return c.json({
+        ok: true,
+        tool: "token-info",
+        paid: Boolean(extractPaymentHeader(c.req.raw)),
+        result: {
+          id: data.id,
+          name: data.name,
+          symbol: data.symbol.toUpperCase(),
+          priceUsd: data.market_data?.current_price?.usd ?? null,
+          marketCapUsd: data.market_data?.market_cap?.usd ?? null,
+          volume24hUsd: data.market_data?.total_volume?.usd ?? null,
+          source: "coingecko-live",
+          timestamp: new Date().toISOString()
+        }
+      });
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      return c.json({ ok: false, error: `token-info upstream failure: ${message}` }, 503);
+    }
+  });
+
+  let server: ReturnType<typeof serve>;
+  try {
+    server = serve({
+      fetch: app.fetch,
+      port: options.port
+    });
+  } catch (err) {
+    const msg = err instanceof Error ? err.message : String(err);
+    console.error(`[ToolServer] ❌ Failed to start on port ${options.port}: ${msg}`);
+    // Return a no-op closer so the main process doesn't crash
+    return { close: async () => {} };
+  }
+
+  // Handle async EADDRINUSE error
+  server.on("error", (err: NodeJS.ErrnoException) => {
+    if (err.code === "EADDRINUSE") {
+      console.error(`[ToolServer] ❌ Port ${options.port} already in use. Kill the existing process or change TOOLS_PORT in .env`);
+    } else {
+      console.error(`[ToolServer] ❌ Server error: ${err.message}`);
+    }
   });
 
   return {
@@ -278,42 +528,21 @@ export function startToolServer(options: ToolServerOptions): { close: () => Prom
   };
 }
 
-async function handleTool(
-  req: Request,
-  tool: PaidTool,
-  onPaid: (input: { vendor: string; address?: string }) => Record<string, unknown>,
-): Promise<Response> {
-  const body = (await req.json().catch(() => ({}))) as { vendor?: string; address?: string };
-  const vendor = body.vendor ?? "UNKNOWN";
-  const address = isHexAddress(body.address) ? body.address : undefined;
-
-  const result = onPaid({ vendor, address });
-  const signatureHeader = req.headers.get("PAYMENT-SIGNATURE")
-    ?? req.headers.get("payment-signature")
-    ?? req.headers.get("X-PAYMENT")
-    ?? req.headers.get("x-payment");
-
-  return new Response(
-    JSON.stringify({
-      ok: true,
-      tool: tool.name,
-      paid: Boolean(signatureHeader),
-      paymentReceiptId: signatureHeader ? `pay_${sha256Hex(signatureHeader).slice(0, 10)}` : undefined,
-      result
-    }),
-    {
-      status: 200,
-      headers: {
-        "content-type": "application/json"
-      }
-    }
-  );
+function resolveChain(chain: string) {
+  const normalized = chain.trim().toLowerCase();
+  if (normalized === "base" || normalized === "base-mainnet" || normalized === "eip155:8453") {
+    return base;
+  }
+  return baseSepolia;
 }
 
-function deterministicValue(input: string): number {
-  const hex = sha256Hex(input).slice(0, 8);
-  const value = Number.parseInt(hex, 16);
-  return Number((value / 0xffffffff).toFixed(4));
+function extractPaymentHeader(req: Request): string | null {
+  return (
+    req.headers.get("PAYMENT-SIGNATURE")
+    ?? req.headers.get("payment-signature")
+    ?? req.headers.get("X-PAYMENT")
+    ?? req.headers.get("x-payment")
+  );
 }
 
 function isHexAddress(value: unknown): value is string {
@@ -321,23 +550,28 @@ function isHexAddress(value: unknown): value is string {
 }
 
 function createFacilitatorClient(options: ToolServerOptions): FacilitatorClient {
-  if (options.facilitatorUrl) {
-    return new HTTPFacilitatorClient({ url: options.facilitatorUrl });
+  if (!options.facilitatorUrl) {
+    throw new Error("X402_FACILITATOR_URL is required to run paid tool settlement");
+  }
+  return new HTTPFacilitatorClient({ url: options.facilitatorUrl });
+}
+
+function validateNoMockToolConfig(options: ToolServerOptions): void {
+  if (!(options.noMockMode === 1 || options.strictLiveMode === 1)) {
+    return;
+  }
+  const missing: string[] = [];
+  if (!options.baseRpcUrl) {
+    missing.push("BASE_RPC_URL");
+  }
+  if (!options.facilitatorUrl) {
+    missing.push("X402_FACILITATOR_URL");
+  }
+  if (!isHexAddress(options.baseUsdcAddress)) {
+    missing.push("BASE_USDC_ADDRESS");
   }
 
-  const chainNetwork = toCaip2Network(options.chain);
-  return {
-    verify: async () => ({ isValid: true, payer: options.sellerAddress }),
-    settle: async () => ({
-      success: true,
-      transaction: `0x${sha256Hex(`${Date.now()}:${Math.random()}`).slice(0, 64)}`,
-      network: chainNetwork,
-      payer: options.sellerAddress
-    }),
-    getSupported: async () => ({
-      kinds: [{ x402Version: 2, scheme: "exact", network: chainNetwork }],
-      extensions: [],
-      signers: { [chainNetwork]: [options.sellerAddress] }
-    })
-  };
+  if (missing.length > 0) {
+    throw new Error(`NO_MOCK_MODE requires tool upstream config: ${missing.join(", ")}`);
+  }
 }

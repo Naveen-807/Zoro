@@ -1,4 +1,3 @@
-import { randomBytes } from "crypto";
 import { createWalletClient, custom, defineChain, hexToBigInt } from "viem";
 import { privateKeyToAccount } from "viem/accounts";
 import type { AppConfig } from "../config.js";
@@ -120,14 +119,6 @@ export class BiteService {
   }
 
   async encryptTransaction(input: { to: string; data: string }): Promise<{ to: string; data: string; gasLimit?: string }> {
-    if (this.config.STRICT_LIVE_MODE !== 1) {
-      return {
-        to: input.to,
-        data: `0xenc${randomBytes(16).toString("hex")}`,
-        gasLimit: "0x493e0"
-      };
-    }
-
     if (this.config.SKALE_ENABLED !== 1 || !this.config.SKALE_RPC_URL) {
       throw new Error("SKALE is not fully configured for strict live BITE mode");
     }
@@ -143,10 +134,6 @@ export class BiteService {
   }
 
   async submitEncryptedTransaction(payload: Record<string, unknown>): Promise<string> {
-    if (this.config.STRICT_LIVE_MODE !== 1) {
-      return `0x${randomBytes(32).toString("hex")}`;
-    }
-
     if (!this.config.SKALE_RPC_URL || !this.config.SKALE_CHAIN_ID || !this.config.EXECUTOR_PRIVATE_KEY) {
       throw new Error("Missing SKALE signing config for encrypted transaction submission");
     }
@@ -209,15 +196,6 @@ export class BiteService {
   }
 
   async getDecryptedTransactionData(txHash: string): Promise<Record<string, unknown>> {
-    if (this.config.STRICT_LIVE_MODE !== 1) {
-      return {
-        txHash,
-        decryptedTo: this.config.SKALE_USDC_ADDRESS,
-        decryptedDataSummary: "ERC20 transfer(to, amount)",
-        by: "bite_getDecryptedTransactionData"
-      };
-    }
-
     if (!this.config.SKALE_RPC_URL) {
       throw new Error("SKALE_RPC_URL is required to fetch decrypted transaction data");
     }

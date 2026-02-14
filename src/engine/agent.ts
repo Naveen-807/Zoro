@@ -1,5 +1,7 @@
 import { GoogleGenerativeAI } from "@google/generative-ai";
 import type { ParsedCommand, ToolPlanItem } from "../types/domain.js";
+import { shortId } from "../utils/hash.js";
+import { nowIso } from "../utils/time.js";
 
 const AGENT_PLANNING_PROMPT = `You are Zoro, an autonomous on-chain commerce agent. You are given:
 1. A parsed user command (payment, swap, or encrypted payout)
@@ -45,6 +47,39 @@ export type AgentPlan = {
     notes: string;
 };
 
+export type AgentGoal = {
+    id: string;
+    description: string;
+    status: "PENDING" | "IN_PROGRESS" | "COMPLETED" | "FAILED";
+    subGoals: AgentSubGoal[];
+    createdAt: string;
+    completedAt?: string;
+};
+
+export type AgentSubGoal = {
+    id: string;
+    description: string;
+    status: "PENDING" | "COMPLETED" | "FAILED";
+    toolRequired?: string;
+};
+
+export type ReasoningStep = {
+    phase: "UNDERSTAND" | "ASSESS_RISK" | "PLAN_TOOLS" | "ESTIMATE_COST";
+    thought: string;
+    confidence?: number;
+    approved?: boolean;
+    tools?: ToolPlanItem[];
+};
+
+export type MultiStepPlan = {
+    steps: ReasoningStep[];
+    recommendation: "PROCEED" | "REVIEW" | "BLOCK";
+};
+
+export type AgentContext = {
+    budget: number;
+};
+
 type AvailableTool = {
     name: string;
     endpoint: string;
@@ -67,6 +102,101 @@ export class AgentReasoner {
 
     get isAvailable(): boolean {
         return this.model !== null;
+    }
+
+    createGoalPlan(command: ParsedCommand): AgentGoal {
+        const goal: AgentGoal = {
+            id: shortId("goal", command.kind),
+            description: `Execute ${command.kind} command`,
+            status: "PENDING",
+            subGoals: [],
+            createdAt: nowIso()
+        };
+
+        if (command.kind === "PAY_VENDOR") {
+            goal.subGoals = [
+                { id: "parse", description: "Parse and validate command", status: "COMPLETED" },
+                { id: "risk", description: "Assess vendor risk", status: "PENDING", toolRequired: "vendor-risk" },
+                { id: "compliance", description: "Check compliance", status: "PENDING", toolRequired: "compliance-check" },
+                { id: "approve", description: "Get user approval", status: "PENDING" },
+                { id: "settle", description: "Execute settlement", status: "PENDING" }
+            ];
+        } else if (command.kind === "TREASURY_SWAP") {
+            goal.subGoals = [
+                { id: "parse", description: "Parse and validate command", status: "COMPLETED" },
+                { id: "research", description: "Gather market price data", status: "PENDING", toolRequired: "price-check" },
+                { id: "approve", description: "Get user approval", status: "PENDING" },
+                { id: "swap", description: "Execute on-chain swap", status: "PENDING" }
+            ];
+        } else if (command.kind === "PRIVATE_PAYOUT") {
+            goal.subGoals = [
+                { id: "parse", description: "Parse and validate command", status: "COMPLETED" },
+                { id: "encrypt", description: "Encrypt transaction payload", status: "PENDING" },
+                { id: "condition", description: "Wait for unlock condition", status: "PENDING" },
+                { id: "submit", description: "Submit encrypted transaction", status: "PENDING" },
+                { id: "decrypt", description: "Fetch decrypted transaction data", status: "PENDING" }
+            ];
+        }
+
+        return goal;
+    }
+
+    async multiStepReasoning(command: ParsedCommand, context: AgentContext): Promise<MultiStepPlan> {
+        const steps: ReasoningStep[] = [];
+        const normalizedKind = command.kind.toLowerCase().replace("_", " ");
+        steps.push({
+            phase: "UNDERSTAND",
+            thought: `User wants to ${normalizedKind}`,
+            confidence: 0.95
+        });
+
+        const risk = this.assessRisk(command);
+        steps.push({
+            phase: "ASSESS_RISK",
+            thought: `Risk assessment: ${risk.level}. ${risk.reasoning}`,
+            confidence: risk.confidence
+        });
+
+        const tools = this.planTools(command, risk.level);
+        steps.push({
+            phase: "PLAN_TOOLS",
+            thought: tools.length > 0
+                ? `Will call ${tools.map((tool) => tool.toolName).join(", ")} to gather information`
+                : "No paid tools required for this command",
+            tools
+        });
+
+        const totalCost = tools.reduce((sum, tool) => sum + tool.priceUsdc, 0);
+        steps.push({
+            phase: "ESTIMATE_COST",
+            thought: `Total tool cost: $${totalCost.toFixed(2)}. Budget: $${context.budget.toFixed(2)}`,
+            approved: totalCost <= context.budget
+        });
+
+        return {
+            steps,
+            recommendation: this.generateRecommendation(steps)
+        };
+    }
+
+    async decideToolChain(toolResults: Array<{ toolName: string; result: unknown; costUsdc: number }>): Promise<{
+        shouldChain: boolean;
+        reasoning: string;
+        nextTool: string | null;
+    }> {
+        const compliance = toolResults.find((entry) => entry.toolName === "compliance-check");
+        if (!compliance) {
+            return {
+                shouldChain: true,
+                reasoning: "Compliance signal is missing, chain to compliance-check.",
+                nextTool: "compliance-check"
+            };
+        }
+        return {
+            shouldChain: false,
+            reasoning: "Existing tool set already includes compliance-check.",
+            nextTool: null
+        };
     }
 
     /**
@@ -294,5 +424,69 @@ RULES:
             action: "PROCEED",
             reasoning: `All ${toolResults.length} tool checks passed. Safe to proceed with settlement.`
         };
+    }
+
+    private assessRisk(command: ParsedCommand): { level: "LOW" | "MEDIUM" | "HIGH"; reasoning: string; confidence: number } {
+        if (command.kind === "PAY_VENDOR") {
+            if (command.amountUsdc >= 500) {
+                return { level: "HIGH", reasoning: "High-value payout requires deeper checks.", confidence: 0.9 };
+            }
+            if (command.amountUsdc >= 100) {
+                return { level: "MEDIUM", reasoning: "Mid-size payout should include compliance screening.", confidence: 0.85 };
+            }
+            return { level: "LOW", reasoning: "Low-value payout with standard checks.", confidence: 0.8 };
+        }
+        if (command.kind === "TREASURY_SWAP") {
+            if (command.amountUsdc >= 200) {
+                return { level: "MEDIUM", reasoning: "Larger swap amount increases execution sensitivity.", confidence: 0.8 };
+            }
+            return { level: "LOW", reasoning: "Swap size is within normal range.", confidence: 0.75 };
+        }
+        return { level: "LOW", reasoning: "Encrypted payout risk is policy-driven.", confidence: 0.7 };
+    }
+
+    private planTools(command: ParsedCommand, risk: "LOW" | "MEDIUM" | "HIGH"): ToolPlanItem[] {
+        if (command.kind === "PAY_VENDOR") {
+            const tools: ToolPlanItem[] = [
+                {
+                    toolName: "vendor-risk",
+                    endpoint: "/tools/vendor-risk",
+                    priceUsdc: 0.25,
+                    reason: "Assess vendor address risk before payout."
+                }
+            ];
+            if (risk !== "LOW" || command.amountUsdc >= 50) {
+                tools.push({
+                    toolName: "compliance-check",
+                    endpoint: "/tools/compliance-check",
+                    priceUsdc: 0.5,
+                    reason: "Run sanctions/compliance screening."
+                });
+            }
+            return tools;
+        }
+        if (command.kind === "TREASURY_SWAP") {
+            return [
+                {
+                    toolName: "price-check",
+                    endpoint: "/tools/price-check",
+                    priceUsdc: 0.1,
+                    reason: "Get market data before executing swap."
+                }
+            ];
+        }
+        return [];
+    }
+
+    private generateRecommendation(steps: ReasoningStep[]): "PROCEED" | "REVIEW" | "BLOCK" {
+        const costStep = steps.find((step) => step.phase === "ESTIMATE_COST");
+        if (costStep?.approved === false) {
+            return "BLOCK";
+        }
+        const riskStep = steps.find((step) => step.phase === "ASSESS_RISK");
+        if (riskStep?.thought.includes("HIGH")) {
+            return "REVIEW";
+        }
+        return "PROCEED";
     }
 }

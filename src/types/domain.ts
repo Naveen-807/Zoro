@@ -111,7 +111,7 @@ export type AP2Receipt = {
   id: string;
   docId: string;
   cmdId: string;
-  kind: "TOOL" | "SETTLEMENT" | "ABORT" | "ENCRYPTED" | "DEFI" | "RECURRING" | "AGENT_PLAN" | "AGENT_REFLECTION";
+  kind: "TOOL" | "SETTLEMENT" | "ABORT" | "ENCRYPTED" | "DEFI" | "RECURRING" | "AGENT_PLAN" | "AGENT_REFLECTION" | "TOOL_CHAIN" | "AGENT_GOAL";
   payload: Record<string, unknown>;
   createdAt: string;
 };
