@@ -1,21 +1,18 @@
 import { Hono } from "hono";
 import { serve } from "@hono/node-server";
 import type { Orchestrator } from "../engine/orchestrator.js";
-import type { WalletConnectService } from "../wc/walletconnect.js";
 import type { AppConfig } from "../config.js";
 
 export type HttpServerDeps = {
   orchestrator: Orchestrator;
-  walletConnect: WalletConnectService;
   config: AppConfig;
 };
 
-export function startHttpServer({ orchestrator, walletConnect, config }: HttpServerDeps): { close: () => Promise<void> } {
+export function startHttpServer({ orchestrator, config }: HttpServerDeps): { close: () => Promise<void> } {
   const app = new Hono();
 
   app.get("/", async (c) => {
     const docId = config.GOOGLE_DOC_ID ?? "local-doc";
-    const session = await walletConnect.syncSession(docId).catch(() => walletConnect.getSession(docId));
     return c.json({
       service: "zoro",
       mode: config.STRICT_LIVE_MODE === 1 ? "LIVE" : "DEV",
@@ -24,14 +21,10 @@ export function startHttpServer({ orchestrator, walletConnect, config }: HttpSer
         tick: `POST /api/tick/${docId}`,
         trace: "GET /api/commands/:docId/:cmdId/trace",
         receipt: "GET /api/receipt/:docId/:cmdId",
-        approval: "POST /api/ap2/cmd/:docId/:cmdId/request-approval"
+        approval: "POST /api/ap2/cmd/:docId/:cmdId/request-approval",
+        evidence: "GET /api/evidence/:docId/:cmdId"
       },
-      walletConnect: session
-        ? {
-          pending: session.pending,
-          address: session.address || null
-        }
-        : { pending: false, address: null }
+      auth: "cdp-wallet-eip712"
     });
   });
 

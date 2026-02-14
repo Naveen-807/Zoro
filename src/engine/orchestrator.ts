@@ -5,7 +5,6 @@ import type { Repo } from "../db/repo.js";
 import { buildCartMandate, buildIntentMandate, buildPaymentMandate, verifyAuthorizationSignature } from "../ap2/ap2.js";
 import { chooseToolPlan, evaluatePolicy, requiresApproval } from "./policy.js";
 import type { GoogleDocService } from "../google/doc.js";
-import type { WalletConnectService } from "../wc/walletconnect.js";
 import type { CdpWalletService } from "../x402/cdp.js";
 import { x402Fetch } from "../x402/x402-client.js";
 import { nowIso, startOfUtcDay } from "../utils/time.js";
@@ -23,7 +22,6 @@ import { buildBaseAddressExplorerUrl, buildBaseTxExplorerUrl } from "../utils/ex
 
 export class Orchestrator {
   private readonly reportedInputIssues = new Set<string>();
-  private readonly reportedConnectionIssues = new Set<string>();
   private llmParser: LlmIntentParser | null = null;
   private notifier: NotificationService | null = null;
   private scheduler: RecurringScheduler | null = null;
@@ -34,7 +32,6 @@ export class Orchestrator {
     private readonly config: AppConfig,
     private readonly repo: Repo,
     private readonly docService: GoogleDocService,
-    private readonly wcService: WalletConnectService,
     private readonly cdpWallet: CdpWalletService,
     private readonly defiSwapService: DefiSwapService,
     private readonly biteService: BiteService
@@ -187,52 +184,6 @@ export class Orchestrator {
     }
   }
 
-  async pollForWalletConnect(docId: string): Promise<void> {
-    try {
-      const pastedUri = await this.docService.readWalletConnectUri();
-      if (pastedUri) {
-        const pending = await this.wcService.connectFromUri(docId, pastedUri);
-        await this.docService.updateConnectionStatus({
-          state: pending.pending ? "CONNECTING" : "CONNECTED",
-          uri: pending.uri,
-          address: pending.address || undefined
-        });
-        await this.docService.clearWalletConnectUri();
-      }
-
-      const session = await this.wcService.syncSession(docId);
-      if (session?.pending) {
-        await this.docService.updateConnectionStatus({
-          state: "CONNECTING",
-          uri: session.uri
-        });
-        return;
-      }
-
-      if (session && !session.pending) {
-        await this.docService.updateConnectionStatus({
-          state: "CONNECTED",
-          uri: session.uri,
-          address: session.address,
-          connectedAt: nowIso()
-        });
-        return;
-      }
-
-      const uri = await this.wcService.generateConnectionUri(docId);
-      await this.docService.updateConnectionStatus({
-        state: "DISCONNECTED",
-        uri
-      });
-    } catch (error) {
-      const message = error instanceof Error ? error.message : String(error);
-      if (!this.reportedConnectionIssues.has(message)) {
-        this.reportedConnectionIssues.add(message);
-        await this.docService.appendAuditLine(`ZORO CONNECT_ERROR message="${message}"`);
-      }
-    }
-  }
-
   async pollForApprovals(docId: string): Promise<void> {
     const pendingRows = await this.docService.readPendingApprovals();
     for (const row of pendingRows) {
@@ -248,10 +199,6 @@ export class Orchestrator {
         await this.docService.updatePendingStatus(row.cmdId, result.approved ? "APPROVED" : "FAILED");
       } catch (error) {
         const message = error instanceof Error ? error.message : String(error);
-        if (message.includes("pending approval") || message.includes("No WalletConnect session")) {
-          await this.docService.updatePendingStatus(row.cmdId, "AWAITING_APPROVAL");
-          continue;
-        }
         await this.docService.updatePendingStatus(row.cmdId, "FAILED");
         await this.docService.appendAuditLine(`ZORO ${row.cmdId} APPROVAL_FAILED reason="${message}"`);
       }
@@ -277,7 +224,11 @@ export class Orchestrator {
       message: Record<string, unknown>;
     };
 
-    const signatureResult = await this.wcService.requestTypedDataSignature(docId, typedData);
+    // ── CDP wallet self-signs the cart mandate ──────────────────────
+    // The user already authorized via the Google Doc checkbox.
+    // The agent's CDP wallet signs the EIP-712 typed data to create
+    // a cryptographic authorization record (AP2 cart mandate).
+    const signatureResult = await this.cdpWallet.signCartMandate(typedData);
     const verification = await verifyAuthorizationSignature({
       mandate: cart,
       signature: signatureResult.signature,
@@ -285,9 +236,9 @@ export class Orchestrator {
     });
 
     if (!verification.valid || !verification.signerAddress) {
-      this.repo.updateCommandStatus(docId, cmdId, "FAILED", "Authorization signature verification failed");
+      this.repo.updateCommandStatus(docId, cmdId, "FAILED", "Cart mandate signature verification failed");
       await this.docService.syncCommandStatusByCmdId(cmdId, "FAILED");
-      return { approved: false, error: "Authorization signature verification failed" };
+      return { approved: false, error: "Cart mandate signature verification failed" };
     }
 
     const signedCart = {
@@ -306,9 +257,10 @@ export class Orchestrator {
       cmdId,
       kind: "SETTLEMENT",
       payload: {
-        event: "AUTH_APPROVED",
+        event: "CART_MANDATE_SIGNED",
         signer: verification.signerAddress,
-        signature: signatureResult.signature
+        signature: signatureResult.signature,
+        method: "cdp-wallet-eip712"
       },
       createdAt: nowIso()
     };
@@ -1348,7 +1300,6 @@ export class Orchestrator {
 
   async tick(docId: string): Promise<void> {
     await this.ingestDocCommands(docId);
-    await this.pollForWalletConnect(docId);
     await this.pollForApprovals(docId);
 
     const approved = this.repo.listCommandsByStatus("APPROVED").filter((e) => e.docId === docId);

@@ -84,6 +84,32 @@ export class CdpWalletService {
     };
   }
 
+  /**
+   * Sign an AP2 cart mandate (EIP-712 typed data) using the CDP wallet.
+   * This replaces WalletConnect — the agent's own wallet authorizes the spend.
+   */
+  async signCartMandate(typedData: {
+    domain: Record<string, unknown>;
+    types: Record<string, Array<{ name: string; type: string }>>;
+    primaryType: string;
+    message: Record<string, unknown>;
+  }): Promise<{ signerAddress: string; signature: string }> {
+    const account = await this.getServerAccount();
+    const address = (await this.getAddress()) as `0x${string}`;
+
+    if (typeof account.signTypedData !== "function") {
+      throw new Error("CDP account does not support signTypedData for cart mandate");
+    }
+
+    const signature = await account.signTypedData(typedData);
+    const hex = normalizeSignatureHex(signature);
+    if (!hex) {
+      throw new Error("CDP signTypedData returned empty signature for cart mandate");
+    }
+
+    return { signerAddress: address, signature: hex };
+  }
+
   async getAddress(): Promise<string> {
     const wallet = await this.getOrCreateWallet();
     return wallet.address;

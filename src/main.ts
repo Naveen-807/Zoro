@@ -3,7 +3,6 @@ import { createDb, runMigrations } from "./db/db.js";
 import { Repo } from "./db/repo.js";
 import { getGoogleAuth, getServiceAccountEmail, ensureSecretDirs } from "./google/auth.js";
 import { GoogleDocService } from "./google/doc.js";
-import { WalletConnectService } from "./wc/walletconnect.js";
 import { CdpWalletService } from "./x402/cdp.js";
 import { DefiSwapService } from "./defi/swap.js";
 import { BiteService } from "./bite/bite.js";
@@ -75,7 +74,6 @@ async function main(): Promise<void> {
   console.log(`Doc ID: ${docId}`);
 
   // ─── Services ────────────────────────────────────────────────────
-  const walletConnect = new WalletConnectService(config);
   const cdpWallet = new CdpWalletService(config);
   const defiSwap = new DefiSwapService(config, cdpWallet);
   const bite = new BiteService(config);
@@ -88,7 +86,6 @@ async function main(): Promise<void> {
     config,
     repo,
     docService,
-    walletConnect,
     cdpWallet,
     defiSwap,
     bite
@@ -130,7 +127,6 @@ async function main(): Promise<void> {
 
   const httpServer = startHttpServer({
     orchestrator,
-    walletConnect,
     config
   });
 
