@@ -111,6 +111,138 @@ export function startHttpServer({ orchestrator, walletConnect, config }: HttpSer
     return c.json(orchestrator.buildSpendSummary(docId, cmdId));
   });
 
+  // ══════════════════════════════════════════════════════════════════════════
+  // EVIDENCE EXPORT — One endpoint for judges to verify all tracks
+  // ══════════════════════════════════════════════════════════════════════════
+  app.get("/api/evidence/:docId/:cmdId", (c) => {
+    const docId = c.req.param("docId");
+    const cmdId = c.req.param("cmdId");
+    const trace = orchestrator.getTrace(docId, cmdId);
+    const spend = orchestrator.buildSpendSummary(docId, cmdId);
+    const command = trace.command;
+    const settlement = trace.ap2Receipts.find(r => r.kind === "SETTLEMENT");
+    const agentPlan = trace.ap2Receipts.find(r => r.kind === "AGENT_PLAN");
+    const reflection = trace.ap2Receipts.find(r => r.kind === "AGENT_REFLECTION");
+
+    return c.json({
+      _meta: {
+        exportedAt: new Date().toISOString(),
+        hackathon: "San Francisco Agentic Commerce x402 Hackathon",
+        tracks: ["Overall Best Agent", "x402 Tool Usage", "AP2 Integration", "DeFi Agent"]
+      },
+
+      // ─── Overall: End-to-end workflow ───────────────────────────────────────
+      workflow: {
+        discover: command?.parsed ? `Parsed ${command.parsed.kind} from user input` : null,
+        decide: agentPlan ? {
+          reasoning: (agentPlan.payload as any)?.reasoning,
+          riskAssessment: (agentPlan.payload as any)?.riskAssessment,
+          toolsPlanned: (agentPlan.payload as any)?.toolPlan
+        } : null,
+        pay: spend.toolReceipts.map(r => ({
+          tool: r.toolName,
+          cost: `$${r.costUsdc.toFixed(2)}`,
+          flow: `HTTP ${r.initialStatus} → payment → HTTP ${r.retryStatus}`
+        })),
+        settle: settlement ? {
+          txHash: (settlement.payload as any)?.txHash,
+          explorerUrl: (settlement.payload as any)?.explorerUrl,
+          blockNumber: (settlement.payload as any)?.blockNumber,
+          status: (settlement.payload as any)?.settlementStatus
+        } : null,
+        outcome: command?.status
+      },
+
+      // ─── x402 Track: Tool chaining + payments ───────────────────────────────
+      x402: {
+        totalToolCalls: spend.toolReceipts.length,
+        totalSpent: `$${spend.totalUsdc.toFixed(2)} USDC`,
+        toolChain: spend.toolReceipts.map(r => ({
+          tool: r.toolName,
+          traceId: r.traceId,
+          initialStatus: r.initialStatus,
+          paymentAttempted: r.paymentAttempted,
+          retryStatus: r.retryStatus,
+          costUsdc: r.costUsdc,
+          timestamp: r.createdAt
+        })),
+        budgetAwareness: agentPlan ? (agentPlan.payload as any)?.reasoning : null
+      },
+
+      // ─── AP2 Track: Intent → Authorization → Settlement ─────────────────────
+      ap2: {
+        intent: trace.intent ? {
+          id: trace.intent.id,
+          action: trace.intent.action,
+          maxTotalUsdc: trace.intent.maxTotalUsdc,
+          toolPlan: trace.intent.toolPlan,
+          createdAt: trace.intent.createdAt
+        } : null,
+        cartMandate: trace.cart ? {
+          id: trace.cart.id,
+          intentId: trace.cart.intentId,
+          signerAddress: trace.cart.signerAddress,
+          signature: trace.cart.signature,
+          expiresAt: trace.cart.expiresAt
+        } : null,
+        authorization: trace.ap2Receipts.filter(r => 
+          r.kind === "TOOL" || r.kind === "SETTLEMENT" || r.kind === "AGENT_PLAN"
+        ),
+        settlement: settlement ? {
+          txHash: (settlement.payload as any)?.txHash,
+          explorerUrl: (settlement.payload as any)?.explorerUrl,
+          blockNumber: (settlement.payload as any)?.blockNumber,
+          spendTotalUsdc: (settlement.payload as any)?.spendTotalUsdc
+        } : null,
+        receipts: trace.ap2Receipts
+      },
+
+      // ─── DeFi Track: Research + reasoning + execution ───────────────────────
+      defi: command?.parsed?.kind === "TREASURY_SWAP" ? {
+        action: "SWAP",
+        research: trace.ap2Receipts.filter(r => 
+          (r.payload as any)?.tool === "price-check"
+        ),
+        reasoning: reflection ? (reflection.payload as any)?.reasoning : null,
+        riskControls: {
+          slippageBps: (command.parsed as any)?.slippageBps,
+          maxSpendUsdc: (command.parsed as any)?.maxSpendUsdc
+        }
+      } : null,
+
+      // ─── Agent reasoning trace ──────────────────────────────────────────────
+      agentReasoning: {
+        plan: agentPlan?.payload,
+        reflection: reflection?.payload,
+        allReceipts: trace.ap2Receipts.filter(r => 
+          r.kind === "AGENT_PLAN" || r.kind === "AGENT_REFLECTION" || r.kind === "AGENT_GOAL"
+        )
+      },
+
+      // ─── Raw data for verification ──────────────────────────────────────────
+      raw: {
+        command: trace.command,
+        x402Receipts: trace.x402Receipts,
+        ap2Receipts: trace.ap2Receipts
+      }
+    });
+  });
+
+  // List all commands for a doc (for evidence discovery)
+  app.get("/api/evidence/:docId", (c) => {
+    const docId = c.req.param("docId");
+    const commands = orchestrator.listAllCommands(docId);
+    return c.json({
+      docId,
+      commands: commands.map(cmd => ({
+        cmdId: cmd.cmdId,
+        kind: cmd.parsed.kind,
+        status: cmd.status,
+        evidenceUrl: `/api/evidence/${docId}/${cmd.cmdId}`
+      }))
+    });
+  });
+
   let server: ReturnType<typeof serve>;
   try {
     server = serve({ fetch: app.fetch, port: config.PORT });

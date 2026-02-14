@@ -1,0 +1,20 @@
+app = "replace-with-fly-app-name"
+primary_region = "iad"
+
+[build]
+
+[env]
+  NODE_ENV = "production"
+  PORT = "3000"
+  TOOLS_PORT = "8788"
+  STRICT_LIVE_MODE = "1"
+  NO_MOCK_MODE = "1"
+  TESTNET_ONLY = "1"
+
+[http_service]
+  internal_port = 3000
+  force_https = true
+  auto_stop_machines = "stop"
+  auto_start_machines = true
+  min_machines_running = 0
+  processes = ["app"]
